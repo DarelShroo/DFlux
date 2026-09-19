@@ -17,7 +17,10 @@ pub async fn connect_tcp(ip: IpAddr, port: u16, enforce_remote: bool, egress_mgr
     };
 
     let ifname = if enforce_remote {
-        egress_mgr.get_remote_interface()
+        match egress_mgr.get_remote_interface() {
+            Some(iface) => iface,
+            None => return Err(anyhow!("REMOTE egress requested but no remote interface is configured")),
+        }
     } else {
         egress_mgr.get_direct_interface()
     };

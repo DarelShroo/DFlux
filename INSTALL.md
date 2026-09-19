@@ -6,7 +6,7 @@
 
 ## English
 
-This guide is designed for a **freshly formatted Linux machine**. It covers installing all dependencies, compiling DFlux, configuring a VPN (WireGuard), and setting DFlux up to run permanently as a background `systemd` service.
+This guide is designed for a **freshly formatted Linux machine**. It covers installing all dependencies, compiling DFlux, and setting it up to run permanently as a background `systemd` service. You will optionally learn how to configure a VPN (WireGuard) as a remote egress backend.
 
 ### 1. Install System Dependencies
 
@@ -23,8 +23,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 *When prompted, choose option `1` (Proceed with standard installation). After installation, restart your shell or run `source $HOME/.cargo/env`.*
 
-### 3. Setup the Remote VPN (WireGuard)
-You need a secondary network interface to route blocked traffic through. If you use WireGuard, ensure it **does not hijack all system traffic**.
+### 3. (Optional) Setup a Remote Egress Backend (e.g. WireGuard)
+DFlux works in `DIRECT` mode out of the box. If you want DFlux to route blocked traffic through an external connection, you need to configure a remote egress backend. Here is an example using WireGuard to create a new network interface (`tun0`) that routes traffic differently. Ensure it **does not hijack all system traffic**.
 
 1. Create your config file: `sudo nano /etc/wireguard/tun0.conf`
 2. Add your VPN configuration. **CRITICAL:** Add `Table = off` to the `[Interface]` section so it doesn't override your default internet.
@@ -69,17 +69,20 @@ To ensure DFlux runs automatically on boot in the background, create a `systemd`
 ```bash
 sudo nano /etc/systemd/system/dflux.service
 ```
-2. Paste the following configuration. Replace `eth0` with your actual LAN interface (e.g., `wlp14s0` or `enp3s0`), and `tun0` with your VPN interface.
+2. Paste the following configuration. 
+> **Note on Network Interfaces:** DFlux attempts to auto-detect your default internet interface. However, it is highly recommended to specify it explicitly. You can find your active network interfaces by running `ip -br link` or `ip route show default`. Replace `wlp14s0` in the configuration below with your actual LAN interface (e.g., `eth0`, `enp3s0`).
+
 ```ini
 [Unit]
 Description=DFlux Transparent Egress Gateway
-After=network-online.target wg-quick@tun0.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# Ensure you replace wlp14s0 and tun0 with your actual interfaces
-ExecStart=/usr/local/bin/dflux mode enforce --direct-iface wlp14s0 --remote-iface tun0
+# Ensure you replace wlp14s0 with your actual LAN interface.
+# If using a remote egress, append: --remote-iface tun0
+ExecStart=/usr/local/bin/dflux mode enforce --direct-iface wlp14s0
 Restart=on-failure
 RestartSec=5
 # Clean up network state before starting and after stopping
@@ -107,7 +110,7 @@ sudo journalctl -u dflux -f
 
 ## Español
 
-Esta guía está diseñada para una **máquina Linux recién formateada**. Cubre la instalación de todas las dependencias, la compilación de DFlux, la configuración de una VPN (WireGuard) y la configuración de DFlux para que se ejecute permanentemente como un servicio de fondo en `systemd`.
+Esta guía está diseñada para una **máquina Linux recién formateada**. Cubre la instalación de todas las dependencias, la compilación de DFlux y la configuración de DFlux para que se ejecute permanentemente como un servicio de fondo en `systemd`. Opcionalmente, aprenderás a configurar una VPN (WireGuard) como backend de salida (egress) remota.
 
 ### 1. Instalar Dependencias del Sistema
 
@@ -124,8 +127,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 *Cuando pregunte, elige la opción `1` (Proceed with standard installation). Tras la instalación, reinicia tu terminal o ejecuta `source $HOME/.cargo/env`.*
 
-### 3. Configurar la VPN Remota (WireGuard)
-Necesitas una interfaz de red secundaria para canalizar el tráfico bloqueado. Si usas WireGuard, asegúrate de que **no secuestre todo el tráfico del sistema**.
+### 3. (Opcional) Configurar un Backend de Egress Remoto (ej. WireGuard)
+DFlux funciona en modo `DIRECT` por defecto. Si deseas que DFlux canalice el tráfico bloqueado a través de una conexión externa, necesitas configurar un backend de salida remoto. Aquí tienes un ejemplo usando WireGuard para crear una nueva interfaz de red (`tun0`). Asegúrate de que **no secuestre todo el tráfico del sistema**.
 
 1. Crea tu archivo de configuración: `sudo nano /etc/wireguard/tun0.conf`
 2. Añade tu configuración VPN. **CRÍTICO:** Añade `Table = off` a la sección `[Interface]` para que no sobrescriba tu internet por defecto.
@@ -170,17 +173,20 @@ Para que DFlux se ejecute automáticamente al arrancar el ordenador en segundo p
 ```bash
 sudo nano /etc/systemd/system/dflux.service
 ```
-2. Pega la siguiente configuración. **Asegúrate de reemplazar `eth0`** con el nombre de tu interfaz LAN (ej. `wlp14s0` o `enp3s0`), y `tun0` con tu interfaz VPN.
+2. Pega la siguiente configuración.
+> **Nota sobre Interfaces de Red:** DFlux intentará auto-detectar tu interfaz de internet predeterminada. Sin embargo, es muy recomendable especificarla explícitamente. Puedes averiguar cuáles son tus interfaces de red activas ejecutando `ip -br link` o `ip route show default`. Reemplaza `wlp14s0` en la configuración de abajo por tu interfaz LAN real (ej. `eth0`, `enp3s0`).
+
 ```ini
 [Unit]
 Description=DFlux Transparent Egress Gateway
-After=network-online.target wg-quick@tun0.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# Reemplaza wlp14s0 y tun0 por tus interfaces reales
-ExecStart=/usr/local/bin/dflux mode enforce --direct-iface wlp14s0 --remote-iface tun0
+# Reemplaza wlp14s0 por tu interfaz real
+# Si usas un egress remoto, añade al final: --remote-iface tun0
+ExecStart=/usr/local/bin/dflux mode enforce --direct-iface wlp14s0
 Restart=on-failure
 RestartSec=5
 # Limpiar estado de red al detenerse

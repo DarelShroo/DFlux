@@ -1,6 +1,6 @@
 pub mod inspector;
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use anyhow::Result;
 use std::net::SocketAddr;
 use crate::state::{StateManager, Decision};

@@ -29,8 +29,9 @@ async fn main() -> anyhow::Result<()> {
             let config = DFluxConfig::default();
             let mut cfg = config.egress;
             if let Some(d) = direct_iface { cfg.direct_interface = d.clone(); }
-            if let Some(r) = remote_iface { cfg.remote_interface = r.clone(); }
-            let egress_mgr = Arc::new(EgressManager::new(Arc::new(cfg)));
+            if let Some(r) = remote_iface { cfg.remote_interface = Some(r.clone()); }
+            let remote_egress: Option<Arc<dyn egress::RemoteEgress>> = cfg.remote_interface.as_ref().map(|iface| Arc::new(egress::NetworkInterfaceEgress::new(iface.clone())) as Arc<dyn egress::RemoteEgress>);
+            let egress_mgr = Arc::new(EgressManager::new(Arc::new(cfg), remote_egress));
             probes::run_probe(hostname, *remote, egress_mgr).await?;
         }
         Commands::Compare { hostname, direct_iface, remote_iface } => {
@@ -38,16 +39,18 @@ async fn main() -> anyhow::Result<()> {
             let config = DFluxConfig::default();
             let mut cfg = config.egress;
             if let Some(d) = direct_iface { cfg.direct_interface = d.clone(); }
-            if let Some(r) = remote_iface { cfg.remote_interface = r.clone(); }
-            let egress_mgr = Arc::new(EgressManager::new(Arc::new(cfg)));
-            probes::run_probe_compare(hostname, egress_mgr).await?; // Assume run_compare takes egress_mgr, need to fix name to run_probe_compare or similar if it was run_compare. Oh it's run_compare
+            if let Some(r) = remote_iface { cfg.remote_interface = Some(r.clone()); }
+            let remote_egress: Option<Arc<dyn egress::RemoteEgress>> = cfg.remote_interface.as_ref().map(|iface| Arc::new(egress::NetworkInterfaceEgress::new(iface.clone())) as Arc<dyn egress::RemoteEgress>);
+            let egress_mgr = Arc::new(EgressManager::new(Arc::new(cfg), remote_egress));
+            probes::run_probe_compare(hostname, egress_mgr).await?;
         }
         Commands::Mode { mode_type, direct_iface, remote_iface } => {
             let mut config = DFluxConfig::default();
             if let Some(d) = direct_iface { config.egress.direct_interface = d.clone(); }
-            if let Some(r) = remote_iface { config.egress.remote_interface = r.clone(); }
+            if let Some(r) = remote_iface { config.egress.remote_interface = Some(r.clone()); }
             
-            let egress_mgr = Arc::new(EgressManager::new(Arc::new(config.egress.clone())));
+            let remote_egress: Option<Arc<dyn egress::RemoteEgress>> = config.egress.remote_interface.as_ref().map(|iface| Arc::new(egress::NetworkInterfaceEgress::new(iface.clone())) as Arc<dyn egress::RemoteEgress>);
+            let egress_mgr = Arc::new(EgressManager::new(Arc::new(config.egress.clone()), remote_egress));
             let state_manager = StateManager::new(1800); // 30 minutes TTL
             
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -110,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Rollback => {
             println!("Manually rolling back DFlux routing rules...");
             // We just instantiate a dummy engine and call stop()
-            let routing_engine = RoutingEngine::new(12345, "".to_string(), "".to_string());
+            let routing_engine = RoutingEngine::new(12345, "".to_string(), None);
             routing_engine.stop()?;
         }
     }

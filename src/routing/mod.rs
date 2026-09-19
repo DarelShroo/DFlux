@@ -7,11 +7,11 @@ use anyhow::{Result, anyhow};
 pub struct RoutingEngine {
     port: u16,
     direct_iface: String,
-    remote_iface: String,
+    remote_iface: Option<String>,
 }
 
 impl RoutingEngine {
-    pub fn new(port: u16, direct_iface: String, remote_iface: String) -> Self {
+    pub fn new(port: u16, direct_iface: String, remote_iface: Option<String>) -> Self {
         Self {
             port,
             direct_iface,
@@ -37,7 +37,7 @@ table ip dflux {{
         ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8 }} accept
         
         # Catch forwarded LAN traffic and locally re-routed traffic
-        tcp dport {{ 80, 443 }} tproxy to :{} meta mark set 1 accept
+        tcp dport {{ 80, 443 }} tproxy to :{port} meta mark set 1 accept
     }}
     chain output {{
         type route hook output priority mangle; policy accept;
@@ -53,10 +53,10 @@ table ip dflux {{
     chain postrouting {{
         type nat hook postrouting priority srcnat; policy accept;
         # Masquerade traffic leaving through managed interfaces
-        oifname \"{}\" masquerade
-        oifname \"{}\" masquerade
+        oifname \"{direct_iface}\" masquerade
+        {remote_masq}
     }}
-}}", self.port, self.direct_iface, self.remote_iface);
+}}", port = self.port, direct_iface = self.direct_iface, remote_masq = self.remote_iface.as_ref().map_or("".to_string(), |iface| format!("oifname \"{}\" masquerade", iface)));
 
         let mut child = Command::new("nft")
             .arg("-f")

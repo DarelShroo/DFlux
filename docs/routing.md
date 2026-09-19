@@ -27,9 +27,9 @@ table ip dflux {
     }
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
-        # Masquerade on the direct and remote interfaces for NAT forwarding
+        # Masquerade on the direct interface (and remote if configured) for NAT forwarding
         oifname "wlp14s0" masquerade
-        oifname "tun0" masquerade
+        # oifname "tun0" masquerade (added dynamically if a remote egress is configured)
     }
 }
 ```
@@ -76,9 +76,9 @@ table ip dflux {
     }
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
-        # Hacemos masquerade en las interfaces direct y remote para el forwarding NAT
+        # Hacemos masquerade en la interfaz direct (y remote si está configurada) para el forwarding NAT
         oifname "wlp14s0" masquerade
-        oifname "tun0" masquerade
+        # oifname "tun0" masquerade (se añade dinámicamente si hay un egress remoto configurado)
     }
 }
 ```
