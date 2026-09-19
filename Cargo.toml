@@ -1,0 +1,25 @@
+[package]
+name = "dflux"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+ctrlc = "3.5.2"
+hickory-resolver = "0.26.3"
+libc = "0.2.189"
+reqwest = { version = "0.13.5", features = ["default-tls", "hickory-dns", "stream", "json"] }
+rustls = "0.23.45"
+rustls-pki-types = "1.15.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+socket2 = { version = "0.6.5", features = ["all"] }
+thiserror = "2.0.20"
+tls-parser = "0.12.2"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-rustls = "0.26.5"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+webpki-roots = "1.0.9"
+x509-parser = "0.18.1"
