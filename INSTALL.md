@@ -13,7 +13,7 @@ This guide is designed for a **freshly formatted Linux machine**. It covers inst
 Update your system and install the required tools, compilers, and networking libraries:
 ```bash
 sudo apt update
-sudo apt install -y curl build-essential pkg-config libssl-dev nftables wireguard
+sudo apt install -y curl build-essential pkg-config libssl-dev nftables
 ```
 
 ### 2. Install Rust
@@ -106,6 +106,14 @@ You can check the live logs and see how DFlux evaluates and routes your traffic 
 sudo journalctl -u dflux -f
 ```
 
+### 7. Stop and Disable the Service
+If you need to stop DFlux, disable it from starting automatically, and clear any remaining network rules, run:
+```bash
+sudo systemctl stop dflux
+sudo systemctl disable dflux
+sudo /usr/local/bin/dflux rollback
+```
+
 ---
 
 ## Español
@@ -117,7 +125,7 @@ Esta guía está diseñada para una **máquina Linux recién formateada**. Cubre
 Actualiza tu sistema e instala las herramientas requeridas, compiladores y librerías de red:
 ```bash
 sudo apt update
-sudo apt install -y curl build-essential pkg-config libssl-dev nftables wireguard
+sudo apt install -y curl build-essential pkg-config libssl-dev nftables
 ```
 
 ### 2. Instalar Rust
@@ -208,4 +216,12 @@ sudo systemctl start dflux
 Puedes observar los registros en vivo para ver cómo DFlux evalúa y enruta tu tráfico dinámicamente usando:
 ```bash
 sudo journalctl -u dflux -f
+```
+
+### 7. Detener y Deshabilitar el Servicio
+Si necesitas detener DFlux, evitar que arranque automáticamente y limpiar cualquier regla de red restante, ejecuta:
+```bash
+sudo systemctl stop dflux
+sudo systemctl disable dflux
+sudo /usr/local/bin/dflux rollback
 ```
