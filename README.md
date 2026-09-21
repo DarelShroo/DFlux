@@ -67,6 +67,9 @@ target/release/dflux compare dd20bb891979d25aebc8bec07b2b3bbc.r2.cloudflarestora
 - [Routing & TPROXY](docs/routing.md)
 - [Egress Abstraction](docs/egress.md)
 
+### Disclaimer / Acceptable Use
+This software is provided for educational purposes, privacy, and legitimate network management. DFlux is a neutral networking tool that routes traffic dynamically. The authors do not condone, encourage, or support the use of this tool for bypassing legitimate organizational access controls, censorship evasion for illegal activities, or violating any terms of service. You are solely responsible for how you deploy and use this software.
+
 ---
 
 ## Español
@@ -131,3 +134,6 @@ target/release/dflux compare dd20bb891979d25aebc8bec07b2b3bbc.r2.cloudflarestora
 - [Arquitectura](docs/architecture.md)
 - [Enrutamiento y TPROXY](docs/routing.md)
 - [Abstracción de Egress](docs/egress.md)
+
+### Descargo de Responsabilidad / Uso Aceptable
+Este software se proporciona con fines educativos, de privacidad y gestión legítima de redes. DFlux es una herramienta de red neutral que enruta tráfico dinámicamente. Los autores no aprueban, fomentan ni apoyan el uso de esta herramienta para eludir controles de acceso organizacionales legítimos, evadir censura para actividades ilegales o violar términos de servicio. Eres el único responsable del uso y despliegue de este software.
