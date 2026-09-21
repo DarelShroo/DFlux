@@ -45,7 +45,35 @@ sudo wg-quick up tun0
 sudo systemctl enable wg-quick@tun0
 ```
 
-### 4. Compile and Install DFlux
+### 4. Configure DFlux
+DFlux uses environment variables for configuration. You can configure network interfaces, ports, and subnets to exclude from interception.
+
+1. Create a configuration directory:
+```bash
+sudo mkdir -p /etc/dflux
+```
+2. Create the environment file:
+```bash
+sudo nano /etc/dflux/dflux.env
+```
+3. Add the following template and modify as needed:
+```env
+# --- NETWORK & ROUTING ---
+# Exclude private subnets from interception and masquerading
+DFLUX_EXCLUDE_SUBNETS="10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8"
+
+# Main direct interface (default: eth0)
+DFLUX_DIRECT_IFACE="eth0"
+
+# Remote interface for blocked traffic (e.g., VPN)
+# DFLUX_REMOTE_IFACE="tun0"
+
+# --- PORTS ---
+DFLUX_TPROXY_PORT=12345
+DFLUX_PROXY_PORT=8080
+```
+
+### 5. Compile and Install DFlux
 Clone the DFlux repository and compile the optimized release binary:
 ```bash
 # Clone the repository
@@ -62,7 +90,7 @@ sudo cp target/release/dflux /usr/local/bin/dflux
 sudo setcap cap_net_raw,cap_net_admin+ep /usr/local/bin/dflux
 ```
 
-### 5. Create a Systemd Service
+### 6. Create a Systemd Service
 To ensure DFlux runs automatically on boot in the background, create a `systemd` service file.
 
 1. Open a new service file:
@@ -80,9 +108,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Ensure you replace wlp14s0 with your actual LAN interface.
-# If using a remote egress, append: --remote-iface tun0
-ExecStart=/usr/local/bin/dflux mode enforce --direct-iface wlp14s0
+EnvironmentFile=/etc/dflux/dflux.env
+# You can still pass CLI arguments (e.g. --direct-iface), but they are not required if defined in the env file.
+ExecStart=/usr/local/bin/dflux mode enforce
 Restart=on-failure
 RestartSec=5
 # Clean up network state before starting and after stopping
@@ -93,7 +121,7 @@ AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
 WantedBy=multi-user.target
 ```
 
-### 6. Enable and Start the Service
+### 7. Enable and Start the Service
 Reload `systemd` and start DFlux:
 ```bash
 sudo systemctl daemon-reload
@@ -106,7 +134,7 @@ You can check the live logs and see how DFlux evaluates and routes your traffic 
 sudo journalctl -u dflux -f
 ```
 
-### 7. Stop and Disable the Service
+### 8. Stop and Disable the Service
 If you need to stop DFlux, disable it from starting automatically, and clear any remaining network rules, run:
 ```bash
 sudo systemctl stop dflux
@@ -157,7 +185,35 @@ sudo wg-quick up tun0
 sudo systemctl enable wg-quick@tun0
 ```
 
-### 4. Compilar e Instalar DFlux
+### 4. Configurar DFlux
+DFlux utiliza variables de entorno para su configuración. Puedes configurar interfaces de red, puertos y subredes privadas que no deben ser interceptadas.
+
+1. Crea el directorio de configuración:
+```bash
+sudo mkdir -p /etc/dflux
+```
+2. Crea el archivo de entorno:
+```bash
+sudo nano /etc/dflux/dflux.env
+```
+3. Añade la siguiente plantilla y ajústala según tus necesidades:
+```env
+# --- NETWORK & ROUTING ---
+# Private subnets that DFlux should ignore (do not intercept via TPROXY nor masquerade)
+DFLUX_EXCLUDE_SUBNETS="10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8"
+
+# Main direct network interface through which traffic flows by default (default: eth0)
+DFLUX_DIRECT_IFACE="eth0"
+
+# Remote network interface (Alternative, e.g., VPN) for blocked traffic
+# DFLUX_REMOTE_IFACE="tun0"
+
+# --- PORTS ---
+DFLUX_TPROXY_PORT=12345
+DFLUX_PROXY_PORT=8080
+```
+
+### 5. Compilar e Instalar DFlux
 Clona el repositorio de DFlux y compila el binario optimizado:
 ```bash
 # Clona el repositorio
@@ -174,7 +230,7 @@ sudo cp target/release/dflux /usr/local/bin/dflux
 sudo setcap cap_net_raw,cap_net_admin+ep /usr/local/bin/dflux
 ```
 
-### 5. Crear el Servicio Systemd
+### 6. Crear el Servicio Systemd
 Para que DFlux se ejecute automáticamente al arrancar el ordenador en segundo plano, crearemos un servicio `systemd`.
 
 1. Abre un nuevo archivo de servicio:
@@ -192,9 +248,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Reemplaza wlp14s0 por tu interfaz real
-# Si usas un egress remoto, añade al final: --remote-iface tun0
-ExecStart=/usr/local/bin/dflux mode enforce --direct-iface wlp14s0
+EnvironmentFile=/etc/dflux/dflux.env
+# Todavía puedes pasar argumentos (--direct-iface), pero no son obligatorios si los defines en el archivo .env.
+ExecStart=/usr/local/bin/dflux mode enforce
 Restart=on-failure
 RestartSec=5
 # Limpiar estado de red al detenerse
@@ -205,7 +261,7 @@ AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
 WantedBy=multi-user.target
 ```
 
-### 6. Habilitar y Arrancar el Servicio
+### 7. Habilitar y Arrancar el Servicio
 Recarga `systemd` e inicia DFlux:
 ```bash
 sudo systemctl daemon-reload
@@ -218,7 +274,7 @@ Puedes observar los registros en vivo para ver cómo DFlux evalúa y enruta tu t
 sudo journalctl -u dflux -f
 ```
 
-### 7. Detener y Deshabilitar el Servicio
+### 8. Detener y Deshabilitar el Servicio
 Si necesitas detener DFlux, evitar que arranque automáticamente y limpiar cualquier regla de red restante, ejecuta:
 ```bash
 sudo systemctl stop dflux

@@ -18,6 +18,9 @@ use routing::RoutingEngine;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load .env variables if present
+    dotenvy::dotenv().ok();
+
     // Initialize logging
     tracing_subscriber::fmt::init();
 
@@ -60,10 +63,10 @@ async fn main() -> anyhow::Result<()> {
             }).expect("Error setting Ctrl-C handler");
 
             if mode_type == "observe" {
-                println!("Running OBSERVE mode (Local Proxy on :8080). No system routing rules will be modified.");
-                println!("Point your test client to HTTP_PROXY=http://127.0.0.1:8080");
+                println!("Running OBSERVE mode (Local Proxy on :{}). No system routing rules will be modified.", config.gateway.proxy_port);
+                println!("Point your test client to HTTP_PROXY=http://127.0.0.1:{}", config.gateway.proxy_port);
                 tokio::select! {
-                    res = proxy::run_proxy(8080, state_manager, mode_type.clone(), egress_mgr) => {
+                    res = proxy::run_proxy(config.gateway.proxy_port, state_manager, mode_type.clone(), egress_mgr) => {
                         if let Err(e) = res { eprintln!("Proxy error: {}", e); }
                     }
                     _ = rx.recv() => {
@@ -72,7 +75,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             } else if mode_type == "enforce" {
                 println!("WARNING: Running ENFORCE mode. DFlux will intercept system traffic transparently.");
-                let routing_engine = RoutingEngine::new(config.gateway.port, config.egress.direct_interface.clone(), config.egress.remote_interface.clone());
+                let routing_engine = RoutingEngine::new(
+                    config.gateway.port, 
+                    config.egress.direct_interface.clone(), 
+                    config.egress.remote_interface.clone(),
+                    config.gateway.exclude_subnets.clone()
+                );
                 routing_engine.start()?;
                 
                 let watchdog_tx = tx.clone();
@@ -113,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Rollback => {
             println!("Manually rolling back DFlux routing rules...");
             // We just instantiate a dummy engine and call stop()
-            let routing_engine = RoutingEngine::new(12345, "".to_string(), None);
+            let routing_engine = RoutingEngine::new(12345, "".to_string(), None, "".to_string());
             routing_engine.stop()?;
         }
     }

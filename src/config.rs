@@ -17,19 +17,25 @@ pub struct EgressConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     pub port: u16,
+    pub proxy_port: u16,
     pub enable_transparent: bool,
+    pub exclude_subnets: String,
 }
 
 impl DFluxConfig {
     pub fn default() -> Self {
         Self {
             egress: EgressConfig {
-                direct_interface: Self::detect_default_interface().unwrap_or_else(|| "eth0".to_string()),
-                remote_interface: None,
+                direct_interface: std::env::var("DFLUX_DIRECT_IFACE")
+                    .unwrap_or_else(|_| Self::detect_default_interface().unwrap_or_else(|| "eth0".to_string())),
+                remote_interface: std::env::var("DFLUX_REMOTE_IFACE").ok(),
             },
             gateway: GatewayConfig {
-                port: 12345,
+                port: std::env::var("DFLUX_TPROXY_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(12345),
+                proxy_port: std::env::var("DFLUX_PROXY_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080),
                 enable_transparent: true,
+                exclude_subnets: std::env::var("DFLUX_EXCLUDE_SUBNETS")
+                    .unwrap_or_else(|_| "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8".to_string()),
             },
         }
     }

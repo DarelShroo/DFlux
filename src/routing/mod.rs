@@ -8,14 +8,16 @@ pub struct RoutingEngine {
     port: u16,
     direct_iface: String,
     remote_iface: Option<String>,
+    exclude_subnets: String,
 }
 
 impl RoutingEngine {
-    pub fn new(port: u16, direct_iface: String, remote_iface: Option<String>) -> Self {
+    pub fn new(port: u16, direct_iface: String, remote_iface: Option<String>, exclude_subnets: String) -> Self {
         Self {
             port,
             direct_iface,
             remote_iface,
+            exclude_subnets,
         }
     }
 
@@ -34,7 +36,7 @@ table ip dflux {{
     chain prerouting {{
         type filter hook prerouting priority mangle; policy accept;
         # Exclude private subnets and loopback to prevent intercepting LAN/router traffic
-        ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8 }} accept
+        ip daddr {{ {exclude_subnets} }} accept
         
         # Catch forwarded LAN traffic and locally re-routed traffic
         tcp dport {{ 80, 443 }} tproxy to :{port} meta mark set 1 accept
@@ -45,18 +47,21 @@ table ip dflux {{
         meta mark 0x4446 accept
         
         # Exclude private subnets and loopback
-        ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8 }} accept
+        ip daddr {{ {exclude_subnets} }} accept
         
         # Intercept locally generated traffic and mark it to force routing to 'lo'
         tcp dport {{ 80, 443 }} meta mark set 1 accept
     }}
     chain postrouting {{
         type nat hook postrouting priority srcnat; policy accept;
+        # Exclude private subnets from masquerading to prevent breaking local routed traffic (like VPN return paths)
+        ip daddr {{ {exclude_subnets} }} return
+
         # Masquerade traffic leaving through managed interfaces
         oifname \"{direct_iface}\" masquerade
         {remote_masq}
     }}
-}}", port = self.port, direct_iface = self.direct_iface, remote_masq = self.remote_iface.as_ref().map_or("".to_string(), |iface| format!("oifname \"{}\" masquerade", iface)));
+}}", port = self.port, direct_iface = self.direct_iface, exclude_subnets = self.exclude_subnets, remote_masq = self.remote_iface.as_ref().map_or("".to_string(), |iface| format!("oifname \"{}\" masquerade", iface)));
 
         let mut child = Command::new("nft")
             .arg("-f")
