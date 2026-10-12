@@ -45,9 +45,6 @@ table ip dflux {{
         # Exclude private subnets and loopback to prevent intercepting LAN/router traffic
         ip daddr {{ {exclude_subnets} }} accept
         
-        # Clamp TCP MSS to path MTU to prevent packet loss / degradation on tunnels
-        tcp flags syn tcp option maxseg size set rt mtu
-        
         # Catch forwarded LAN traffic and locally re-routed traffic
         tcp dport {{ 80, 443 }} tproxy to :{port} meta mark set 1 accept
     }}
@@ -58,9 +55,6 @@ table ip dflux {{
         
         # Exclude private subnets and loopback
         ip daddr {{ {exclude_subnets} }} accept
-        
-        # Exclude public DNS / DoH resolvers from local TPROXY capture to prevent recursive loops
-        ip daddr {{ 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4, 9.9.9.9 }} accept
         
         # Intercept locally generated traffic and mark it to force routing to 'lo'
         tcp dport {{ 80, 443 }} meta mark set 1 accept
