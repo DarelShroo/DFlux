@@ -1,6 +1,6 @@
-use std::process::{Command, Stdio};
-use std::io::Write;
 use anyhow::{Result, anyhow};
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 /// Manages routing rules using nftables and policy routing.
 /// Replaces the legacy bash scripts and iptables REDIRECT.
@@ -12,7 +12,12 @@ pub struct RoutingEngine {
 }
 
 impl RoutingEngine {
-    pub fn new(port: u16, direct_iface: String, remote_iface: Option<String>, exclude_subnets: String) -> Self {
+    pub fn new(
+        port: u16,
+        direct_iface: String,
+        remote_iface: Option<String>,
+        exclude_subnets: String,
+    ) -> Self {
         Self {
             port,
             direct_iface,
@@ -28,7 +33,9 @@ impl RoutingEngine {
         self.stop().unwrap_or(()); // Clean up previous state if any
 
         // Enable IP forwarding
-        Command::new("sysctl").args(["-w", "net.ipv4.ip_forward=1"]).status()?;
+        Command::new("sysctl")
+            .args(["-w", "net.ipv4.ip_forward=1"])
+            .status()?;
 
         // Write nftables rules to a temporary file
         let rules = format!("
@@ -37,6 +44,9 @@ table ip dflux {{
         type filter hook prerouting priority mangle; policy accept;
         # Exclude private subnets and loopback to prevent intercepting LAN/router traffic
         ip daddr {{ {exclude_subnets} }} accept
+        
+        # Clamp TCP MSS to path MTU to prevent packet loss / degradation on tunnels
+        tcp flags syn tcp option maxseg size set rt mtu
         
         # Catch forwarded LAN traffic and locally re-routed traffic
         tcp dport {{ 80, 443 }} tproxy to :{port} meta mark set 1 accept
@@ -48,6 +58,9 @@ table ip dflux {{
         
         # Exclude private subnets and loopback
         ip daddr {{ {exclude_subnets} }} accept
+        
+        # Exclude public DNS / DoH resolvers from local TPROXY capture to prevent recursive loops
+        ip daddr {{ 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4, 9.9.9.9 }} accept
         
         # Intercept locally generated traffic and mark it to force routing to 'lo'
         tcp dport {{ 80, 443 }} meta mark set 1 accept
@@ -79,8 +92,23 @@ table ip dflux {{
         }
 
         // Add local policy routing to deliver marked packets to the socket, with a specific pref for safe rollback
-        Command::new("ip").args(["rule", "add", "fwmark", "1", "lookup", "100", "pref", "32000"]).status()?;
-        Command::new("ip").args(["route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", "100"]).status()?;
+        Command::new("ip")
+            .args([
+                "rule", "add", "fwmark", "1", "lookup", "100", "pref", "32000",
+            ])
+            .status()?;
+        Command::new("ip")
+            .args([
+                "route",
+                "add",
+                "local",
+                "0.0.0.0/0",
+                "dev",
+                "lo",
+                "table",
+                "100",
+            ])
+            .status()?;
 
         println!("Routing Engine rules applied successfully.");
         Ok(())
@@ -90,20 +118,35 @@ table ip dflux {{
     pub fn stop(&self) -> Result<()> {
         println!("Stopping Routing Engine and reverting changes...");
         // Flush and delete the dflux nftables table
-        Command::new("nft").args(["delete", "table", "ip", "dflux"])
+        Command::new("nft")
+            .args(["delete", "table", "ip", "dflux"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status().unwrap_or_default();
-        
+            .status()
+            .unwrap_or_default();
+
         // Remove policy routing transactionally using the specific pref
-        Command::new("ip").args(["rule", "del", "pref", "32000"])
+        Command::new("ip")
+            .args(["rule", "del", "pref", "32000"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status().unwrap_or_default();
-        Command::new("ip").args(["route", "del", "local", "0.0.0.0/0", "dev", "lo", "table", "100"])
+            .status()
+            .unwrap_or_default();
+        Command::new("ip")
+            .args([
+                "route",
+                "del",
+                "local",
+                "0.0.0.0/0",
+                "dev",
+                "lo",
+                "table",
+                "100",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status().unwrap_or_default();
+            .status()
+            .unwrap_or_default();
 
         println!("Routing Engine stopped.");
         Ok(())

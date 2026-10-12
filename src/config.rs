@@ -1,6 +1,6 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use anyhow::{Result, Context};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DFluxConfig {
@@ -22,28 +22,38 @@ pub struct GatewayConfig {
     pub exclude_subnets: String,
 }
 
-impl DFluxConfig {
-    pub fn default() -> Self {
+impl Default for DFluxConfig {
+    fn default() -> Self {
         Self {
             egress: EgressConfig {
-                direct_interface: std::env::var("DFLUX_DIRECT_IFACE")
-                    .unwrap_or_else(|_| Self::detect_default_interface().unwrap_or_else(|| "eth0".to_string())),
+                direct_interface: std::env::var("DFLUX_DIRECT_IFACE").unwrap_or_else(|_| {
+                    Self::detect_default_interface().unwrap_or_else(|| "eth0".to_string())
+                }),
                 remote_interface: std::env::var("DFLUX_REMOTE_IFACE").ok(),
             },
             gateway: GatewayConfig {
-                port: std::env::var("DFLUX_TPROXY_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(12345),
-                proxy_port: std::env::var("DFLUX_PROXY_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080),
+                port: std::env::var("DFLUX_TPROXY_PORT")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(12345),
+                proxy_port: std::env::var("DFLUX_PROXY_PORT")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(8080),
                 enable_transparent: true,
-                exclude_subnets: std::env::var("DFLUX_EXCLUDE_SUBNETS")
-                    .unwrap_or_else(|_| "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8".to_string()),
+                exclude_subnets: std::env::var("DFLUX_EXCLUDE_SUBNETS").unwrap_or_else(|_| {
+                    "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8".to_string()
+                }),
             },
         }
     }
+}
 
-    #[allow(dead_code)]
+impl DFluxConfig {
     pub fn load(path: &str) -> Result<Self> {
         let content = fs::read_to_string(path).context("Failed to read config file")?;
-        let config: DFluxConfig = serde_json::from_str(&content).context("Failed to parse config file")?;
+        let config: DFluxConfig =
+            serde_json::from_str(&content).context("Failed to parse config file")?;
         Ok(config)
     }
 
@@ -51,7 +61,7 @@ impl DFluxConfig {
     fn detect_default_interface() -> Option<String> {
         if let Ok(output) = std::process::Command::new("ip")
             .args(["route", "show", "default"])
-            .output() 
+            .output()
         {
             let output_str = String::from_utf8_lossy(&output.stdout);
             // output looks like: "default via 192.168.1.1 dev wlp14s0 proto dhcp metric 600"

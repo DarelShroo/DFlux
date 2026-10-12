@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Arquitectura de DFlux",
+    "output": "dflux-architecture.html",
+    "quality_profile": "showcase"
+  },
+  "components": [
+    { "id": "client", "type": "external", "label": "Cliente", "sublabel": "Navegador / Apps", "pos": [40, 300], "size": [120, 60] },
+    { "id": "nftables", "type": "security", "label": "nftables", "sublabel": "TPROXY", "pos": [210, 300], "size": [130, 60] },
+    { "id": "listener", "type": "backend", "label": "Listener TCP", "sublabel": "Local: 12345", "pos": [380, 300], "size": [130, 60] },
+    { "id": "inspector", "type": "backend", "label": "Inspector", "sublabel": "Extraer SNI", "pos": [550, 300], "size": [130, 60] },
+    { "id": "decision", "type": "backend", "label": "Motor de Decisión", "sublabel": "Evaluar ruta", "pos": [720, 300], "size": [140, 60] },
+    { "id": "state", "type": "database", "label": "Gestor de Estado", "sublabel": "Caché", "pos": [720, 150], "size": [140, 60] },
+    { "id": "doh", "type": "security", "label": "Resolutor DoH", "sublabel": "Anti-Envenenamiento", "pos": [720, 450], "size": [140, 60] },
+    { "id": "direct", "type": "cloud", "label": "DirectEgress", "sublabel": "Sondeos TCP/TLS", "pos": [890, 150], "size": [130, 60] },
+    { "id": "remote", "type": "cloud", "label": "RemoteEgress", "sublabel": "Sondeos VPN", "pos": [890, 300], "size": [130, 60] },
+    { "id": "outbound", "type": "backend", "label": "Motor de Salida", "sublabel": "Enlace de Socket", "pos": [890, 450], "size": [140, 60] },
+    { "id": "internet", "type": "external", "label": "Internet", "sublabel": "Destinos", "pos": [1060, 300], "size": [120, 60] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Proceso DFlux", "wraps": ["listener", "inspector", "decision", "state", "doh", "outbound"] },
+    { "kind": "region", "label": "Subsistema de Salida", "wraps": ["direct", "remote"] }
+  ],
+  "connections": [
+    { "id": "c1", "from": "client", "to": "nftables", "label": "HTTPS 443" },
+    { "id": "c2", "from": "nftables", "to": "listener", "label": "redirigir", "labelDy": -24 },
+    { "id": "c3", "from": "listener", "to": "inspector" },
+    { "id": "c4", "from": "inspector", "to": "decision", "label": "SNI" },
+    { "id": "c5", "from": "decision", "to": "state", "label": "consultar caché", "labelDx": -40 },
+    { "id": "c6", "from": "decision", "to": "direct", "label": "sondear", "labelAt": [875, 224] },
+    { "id": "c7", "from": "decision", "to": "remote", "label": "sondeo de respaldo", "labelAt": [930, 374] },
+    { "id": "c8", "from": "decision", "to": "doh", "label": "resolver IP", "labelAt": [745, 374] },
+    { "id": "c9", "from": "decision", "to": "outbound", "label": "comando de ruta", "labelDy": 30 },
+    { "id": "c10", "from": "outbound", "to": "internet", "label": "copia bidireccional" }
+  ]
+}

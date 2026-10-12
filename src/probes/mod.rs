@@ -12,10 +12,84 @@ pub struct ProbeReport {
     pub error_reason: Option<String>,
 }
 
-use std::sync::Arc;
 use crate::egress::EgressManager;
+use std::sync::Arc;
 
-pub async fn run_probe_silent(hostname: &str, remote: bool, egress_mgr: Arc<EgressManager>) -> Result<ProbeReport> {
+use crate::state::Decision;
+
+pub async fn evaluate_route(
+    target_host: &str,
+    port: u16,
+    egress_mgr: Arc<EgressManager>,
+) -> (Decision, bool) {
+    // 1. If remote interface is not configured, direct is the only choice
+    if egress_mgr.get_remote_interface().is_none() {
+        return (Decision::Direct, false);
+    }
+
+    // 2. Optimistic Direct-first probe: test Direct with a 2-second timeout
+    let direct_probe = tokio::time::timeout(
+        std::time::Duration::from_millis(2000),
+        run_probe_silent_port(target_host, port, false, egress_mgr.clone()),
+    )
+    .await;
+
+    let direct_ok = match direct_probe {
+        Ok(Ok(ref report)) => {
+            if port == 443 {
+                report.cert_valid
+            } else {
+                report.tcp_pass
+            }
+        }
+        _ => false,
+    };
+
+    // If Direct route works, NEVER waste time/resources probing Remote!
+    if direct_ok {
+        return (Decision::Direct, false);
+    }
+
+    // 3. Direct route failed or has invalid certificate/poisoning: test Remote
+    let remote_probe = tokio::time::timeout(
+        std::time::Duration::from_millis(2500),
+        run_probe_silent_port(target_host, port, true, egress_mgr.clone()),
+    )
+    .await;
+
+    let remote_ok = match remote_probe {
+        Ok(Ok(ref report)) => {
+            if port == 443 {
+                report.cert_valid
+            } else {
+                report.tcp_pass
+            }
+        }
+        _ => false,
+    };
+
+    if remote_ok {
+        (Decision::Remote, false)
+    } else {
+        // Both failed: fallback to Direct with failure flag (triggers exponential backoff)
+        (Decision::Direct, true)
+    }
+}
+
+pub async fn run_probe_silent(
+    hostname: &str,
+    remote: bool,
+    egress_mgr: Arc<EgressManager>,
+) -> Result<ProbeReport> {
+    run_probe_silent_port(hostname, 443, remote, egress_mgr).await
+}
+
+pub async fn run_probe_silent_port(
+    hostname: &str,
+    port: u16,
+    remote: bool,
+    egress_mgr: Arc<EgressManager>,
+) -> Result<ProbeReport> {
     let mut report = ProbeReport {
         dns_pass: false,
         tcp_pass: false,
@@ -40,7 +114,7 @@ pub async fn run_probe_silent(hostname: &str, remote: bool, egress_mgr: Arc<Egre
 
     let ip = ips[0];
 
-    match tcp::connect(ip, 443, remote, egress_mgr.clone()).await {
+    match tcp::connect(ip, port, remote, egress_mgr.clone()).await {
         Ok(_) => {
             report.tcp_pass = true;
         }
@@ -50,18 +124,26 @@ pub async fn run_probe_silent(hostname: &str, remote: bool, egress_mgr: Arc<Egre
         }
     }
 
-    match tls::handshake_and_verify(hostname, ip, 443, remote, egress_mgr).await {
-        Ok(_) => {
-            report.tls_pass = true;
-            report.cert_valid = true;
+    if port == 443 {
+        match tls::handshake_and_verify(hostname, ip, 443, remote, egress_mgr).await {
+            Ok(_) => {
+                report.tls_pass = true;
+                report.cert_valid = true;
+            }
+            Err(tls::TlsError::HostnameMismatch {
+                expected: _,
+                received: _,
+            }) => {
+                report.tls_pass = true;
+                report.error_reason = Some("CERTIFICATE_HOSTNAME_MISMATCH".to_string());
+            }
+            Err(e) => {
+                report.error_reason = Some(format!("TLS_FAIL: {}", e));
+            }
         }
-        Err(tls::TlsError::HostnameMismatch { expected: _, received: _ }) => {
-            report.tls_pass = true; // Handshake technically worked
-            report.error_reason = Some("CERTIFICATE_HOSTNAME_MISMATCH".to_string());
-        }
-        Err(e) => {
-            report.error_reason = Some(format!("TLS_FAIL: {}", e));
-        }
+    } else {
+        // Non-TLS (e.g. port 80): TCP success is sufficient
+        report.cert_valid = true;
     }
 
     Ok(report)
@@ -138,7 +220,10 @@ pub async fn run_probe_compare(hostname: &str, egress_mgr: Arc<EgressManager>) -
     if direct.tcp_pass {
         println!("  TLS: {}", if direct.cert_valid { "PASS" } else { "FAIL" });
         if !direct.cert_valid {
-            println!("  reason: {}", direct.error_reason.as_deref().unwrap_or("UNKNOWN"));
+            println!(
+                "  reason: {}",
+                direct.error_reason.as_deref().unwrap_or("UNKNOWN")
+            );
         }
     }
 
@@ -152,7 +237,10 @@ pub async fn run_probe_compare(hostname: &str, egress_mgr: Arc<EgressManager>) -
         if remote.cert_valid {
             println!("  certificate: VALID");
         } else {
-            println!("  reason: {}", remote.error_reason.as_deref().unwrap_or("UNKNOWN"));
+            println!(
+                "  reason: {}",
+                remote.error_reason.as_deref().unwrap_or("UNKNOWN")
+            );
         }
     }
 

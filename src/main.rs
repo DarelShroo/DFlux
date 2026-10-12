@@ -1,20 +1,11 @@
-mod config;
-mod egress;
-mod routing;
-mod cli;
-mod outbound;
-mod probes;
-mod proxy;
-mod state;
-mod gateway;
-
 use clap::Parser;
-use cli::{Cli, Commands};
-use state::StateManager;
+use dflux::cli::{Cli, Commands};
+use dflux::config::DFluxConfig;
+use dflux::egress::{self, EgressManager};
+use dflux::routing::RoutingEngine;
+use dflux::state::StateManager;
+use dflux::{gateway, outbound, probes, proxy};
 use std::sync::Arc;
-use config::DFluxConfig;
-use egress::EgressManager;
-use routing::RoutingEngine;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,44 +18,91 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Probe { hostname, remote, direct_iface, remote_iface } => {
+        Commands::Probe {
+            hostname,
+            remote,
+            direct_iface,
+            remote_iface,
+        } => {
             println!("Probing hostname: {}, remote: {}", hostname, remote);
             let config = DFluxConfig::default();
             let mut cfg = config.egress;
-            if let Some(d) = direct_iface { cfg.direct_interface = d.clone(); }
-            if let Some(r) = remote_iface { cfg.remote_interface = Some(r.clone()); }
-            let remote_egress: Option<Arc<dyn egress::RemoteEgress>> = cfg.remote_interface.as_ref().map(|iface| Arc::new(egress::NetworkInterfaceEgress::new(iface.clone())) as Arc<dyn egress::RemoteEgress>);
+            if let Some(d) = direct_iface {
+                cfg.direct_interface = d.clone();
+            }
+            if let Some(r) = remote_iface {
+                cfg.remote_interface = Some(r.clone());
+            }
+            let remote_egress: Option<Arc<dyn egress::RemoteEgress>> =
+                cfg.remote_interface.as_ref().map(|iface| {
+                    Arc::new(egress::NetworkInterfaceEgress::new(iface.clone()))
+                        as Arc<dyn egress::RemoteEgress>
+                });
             let egress_mgr = Arc::new(EgressManager::new(Arc::new(cfg), remote_egress));
             probes::run_probe(hostname, *remote, egress_mgr).await?;
         }
-        Commands::Compare { hostname, direct_iface, remote_iface } => {
+        Commands::Compare {
+            hostname,
+            direct_iface,
+            remote_iface,
+        } => {
             println!("Comparing routes for hostname: {}", hostname);
             let config = DFluxConfig::default();
             let mut cfg = config.egress;
-            if let Some(d) = direct_iface { cfg.direct_interface = d.clone(); }
-            if let Some(r) = remote_iface { cfg.remote_interface = Some(r.clone()); }
-            let remote_egress: Option<Arc<dyn egress::RemoteEgress>> = cfg.remote_interface.as_ref().map(|iface| Arc::new(egress::NetworkInterfaceEgress::new(iface.clone())) as Arc<dyn egress::RemoteEgress>);
+            if let Some(d) = direct_iface {
+                cfg.direct_interface = d.clone();
+            }
+            if let Some(r) = remote_iface {
+                cfg.remote_interface = Some(r.clone());
+            }
+            let remote_egress: Option<Arc<dyn egress::RemoteEgress>> =
+                cfg.remote_interface.as_ref().map(|iface| {
+                    Arc::new(egress::NetworkInterfaceEgress::new(iface.clone()))
+                        as Arc<dyn egress::RemoteEgress>
+                });
             let egress_mgr = Arc::new(EgressManager::new(Arc::new(cfg), remote_egress));
             probes::run_probe_compare(hostname, egress_mgr).await?;
         }
-        Commands::Mode { mode_type, direct_iface, remote_iface } => {
+        Commands::Mode {
+            mode_type,
+            direct_iface,
+            remote_iface,
+        } => {
             let mut config = DFluxConfig::default();
-            if let Some(d) = direct_iface { config.egress.direct_interface = d.clone(); }
-            if let Some(r) = remote_iface { config.egress.remote_interface = Some(r.clone()); }
-            
-            let remote_egress: Option<Arc<dyn egress::RemoteEgress>> = config.egress.remote_interface.as_ref().map(|iface| Arc::new(egress::NetworkInterfaceEgress::new(iface.clone())) as Arc<dyn egress::RemoteEgress>);
-            let egress_mgr = Arc::new(EgressManager::new(Arc::new(config.egress.clone()), remote_egress));
+            if let Some(d) = direct_iface {
+                config.egress.direct_interface = d.clone();
+            }
+            if let Some(r) = remote_iface {
+                config.egress.remote_interface = Some(r.clone());
+            }
+
+            let remote_egress: Option<Arc<dyn egress::RemoteEgress>> =
+                config.egress.remote_interface.as_ref().map(|iface| {
+                    Arc::new(egress::NetworkInterfaceEgress::new(iface.clone()))
+                        as Arc<dyn egress::RemoteEgress>
+                });
+            let egress_mgr = Arc::new(EgressManager::new(
+                Arc::new(config.egress.clone()),
+                remote_egress,
+            ));
             let state_manager = StateManager::new(1800); // 30 minutes TTL
-            
+
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
             let ctrlc_tx = tx.clone();
             ctrlc::set_handler(move || {
                 let _ = ctrlc_tx.blocking_send(());
-            }).expect("Error setting Ctrl-C handler");
+            })
+            .expect("Error setting Ctrl-C handler");
 
             if mode_type == "observe" {
-                println!("Running OBSERVE mode (Local Proxy on :{}). No system routing rules will be modified.", config.gateway.proxy_port);
-                println!("Point your test client to HTTP_PROXY=http://127.0.0.1:{}", config.gateway.proxy_port);
+                println!(
+                    "Running OBSERVE mode (Local Proxy on :{}). No system routing rules will be modified.",
+                    config.gateway.proxy_port
+                );
+                println!(
+                    "Point your test client to HTTP_PROXY=http://127.0.0.1:{}",
+                    config.gateway.proxy_port
+                );
                 tokio::select! {
                     res = proxy::run_proxy(config.gateway.proxy_port, state_manager, mode_type.clone(), egress_mgr) => {
                         if let Err(e) = res { eprintln!("Proxy error: {}", e); }
@@ -74,15 +112,17 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             } else if mode_type == "enforce" {
-                println!("WARNING: Running ENFORCE mode. DFlux will intercept system traffic transparently.");
+                println!(
+                    "WARNING: Running ENFORCE mode. DFlux will intercept system traffic transparently."
+                );
                 let routing_engine = RoutingEngine::new(
-                    config.gateway.port, 
-                    config.egress.direct_interface.clone(), 
+                    config.gateway.port,
+                    config.egress.direct_interface.clone(),
                     config.egress.remote_interface.clone(),
-                    config.gateway.exclude_subnets.clone()
+                    config.gateway.exclude_subnets.clone(),
                 );
                 routing_engine.start()?;
-                
+
                 let watchdog_tx = tx.clone();
                 let watchdog_egress = egress_mgr.clone();
                 tokio::spawn(async move {
@@ -92,14 +132,23 @@ async fn main() -> anyhow::Result<()> {
                         // Health check DIRECT using an external reliable IP
                         if let Ok(Ok(_)) = tokio::time::timeout(
                             tokio::time::Duration::from_secs(5),
-                            outbound::connect_tcp(std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)), 443, false, watchdog_egress.clone())
-                        ).await {
+                            outbound::connect_tcp(
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+                                443,
+                                false,
+                                watchdog_egress.clone(),
+                            ),
+                        )
+                        .await
+                        {
                             failures = 0;
                         } else {
                             failures += 1;
                             eprintln!("WATCHDOG: Direct outbound failed ({} / 3)", failures);
                             if failures >= 3 {
-                                eprintln!("WATCHDOG: CRITICAL NETWORK FAILURE DETECTED. Triggering emergency rollback!");
+                                eprintln!(
+                                    "WATCHDOG: CRITICAL NETWORK FAILURE DETECTED. Triggering emergency rollback!"
+                                );
                                 let _ = watchdog_tx.send(()).await;
                                 break;
                             }

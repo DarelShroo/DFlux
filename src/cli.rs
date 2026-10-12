@@ -13,15 +13,15 @@ pub enum Commands {
     Probe {
         /// The hostname to probe
         hostname: String,
-        
+
         /// Optional: Force use of remote outbound
         #[arg(long)]
         remote: bool,
-        
+
         /// Optional: Override direct interface
         #[arg(long)]
         direct_iface: Option<String>,
-        
+
         /// Optional: Override remote interface
         #[arg(long)]
         remote_iface: Option<String>,
@@ -30,11 +30,11 @@ pub enum Commands {
     Compare {
         /// The hostname to compare
         hostname: String,
-        
+
         /// Optional: Override direct interface
         #[arg(long)]
         direct_iface: Option<String>,
-        
+
         /// Optional: Override remote interface
         #[arg(long)]
         remote_iface: Option<String>,
@@ -44,11 +44,11 @@ pub enum Commands {
         /// Mode type: 'observe' (Local HTTP Proxy on 8080, no routing changes) or 'enforce' (Transparent Gateway on 12345, alters routing)
         #[arg(value_parser = ["observe", "enforce"])]
         mode_type: String,
-        
+
         /// Optional: Override direct interface
         #[arg(long)]
         direct_iface: Option<String>,
-        
+
         /// Optional: Override remote interface
         #[arg(long)]
         remote_iface: Option<String>,
