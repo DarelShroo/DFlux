@@ -1,18 +1,151 @@
 use anyhow::{Result, anyhow};
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
+use std::{future::Future, pin::Pin};
+use thiserror::Error;
 use tokio::net::{TcpSocket, TcpStream};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout};
 
 use crate::egress::EgressManager;
-use std::sync::Arc;
 
+pub const DFLUX_SO_MARK: u32 = 0x4446;
+pub const GLOBAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+
+#[derive(Debug, Error)]
+pub enum IsolationError {
+    #[error("SO_MARK setup failed: {0}")]
+    SoMark(#[source] std::io::Error),
+    #[error("SO_BINDTODEVICE setup failed: {0}")]
+    BindToDevice(#[source] std::io::Error),
+}
+
+/// Connects to a target TCP destination using a single IP address with strict isolation options.
 pub async fn connect_tcp(
     ip: IpAddr,
     port: u16,
     enforce_remote: bool,
     egress_mgr: Arc<EgressManager>,
 ) -> Result<TcpStream> {
+    connect_tcp_candidates(&[ip], port, enforce_remote, egress_mgr).await
+}
+
+/// Connects to a target TCP destination choosing from up to 3 candidate IP addresses,
+/// respecting a cumulative global connection timeout of 4 seconds without resetting the clock.
+pub async fn connect_tcp_candidates(
+    ips: &[IpAddr],
+    port: u16,
+    enforce_remote: bool,
+    egress_mgr: Arc<EgressManager>,
+) -> Result<TcpStream> {
+    connect_tcp_candidates_with(ips, port, enforce_remote, egress_mgr, |ip, port, ifname| {
+        Box::pin(async move {
+            let stream = connect_isolated_socket(ip, port, &ifname).await?;
+            let _ = stream.set_nodelay(true);
+            Ok(stream)
+        })
+    })
+    .await
+}
+
+/// Same candidate-selection flow as the production connector, with only the socket operation
+/// injected. This keeps retry and isolation-abort behavior testable without host capabilities.
+#[doc(hidden)]
+pub async fn connect_tcp_candidates_with<T, F>(
+    ips: &[IpAddr],
+    port: u16,
+    enforce_remote: bool,
+    egress_mgr: Arc<EgressManager>,
+    mut connect: F,
+) -> Result<T>
+where
+    F: FnMut(IpAddr, u16, String) -> Pin<Box<dyn Future<Output = Result<T>> + Send>>,
+{
+    if ips.is_empty() {
+        return Err(anyhow!("No IP addresses provided for connection"));
+    }
+
+    let ifname = if enforce_remote {
+        match egress_mgr.get_remote_interface() {
+            Some(iface) if !iface.trim().is_empty() => iface.to_string(),
+            _ => {
+                return Err(anyhow!(
+                    "REMOTE egress requested but no remote interface is configured"
+                ));
+            }
+        }
+    } else {
+        let direct = egress_mgr.get_direct_interface();
+        if direct.trim().is_empty() {
+            return Err(anyhow!(
+                "DIRECT egress requested but direct_interface is empty or not configured"
+            ));
+        }
+        direct.to_string()
+    };
+
+    let max_candidates = ips.len().min(3);
+    let stream = run_candidates(max_candidates, GLOBAL_CONNECT_TIMEOUT, |idx| {
+        let ip = ips[idx];
+        let ifname = ifname.clone();
+        connect(ip, port, ifname)
+    })
+    .await?;
+    Ok(stream)
+}
+
+#[doc(hidden)]
+pub async fn run_candidates<T, F>(
+    candidate_count: usize,
+    budget: Duration,
+    mut attempt: F,
+) -> Result<T>
+where
+    F: FnMut(usize) -> Pin<Box<dyn Future<Output = Result<T>> + Send>>,
+{
+    let start_time = Instant::now();
+    let mut last_err = None;
+    for idx in 0..candidate_count {
+        let elapsed = start_time.elapsed();
+        if elapsed >= budget {
+            return Err(anyhow!("Global connection timeout ({:?}) exceeded", budget));
+        }
+        let remaining = budget - elapsed;
+        let attempt_timeout = if idx == 0 {
+            remaining.min(Duration::from_secs(2))
+        } else {
+            remaining
+        };
+        match timeout(attempt_timeout, attempt(idx)).await {
+            Ok(Ok(stream)) => {
+                return Ok(stream);
+            }
+            Ok(Err(e)) => {
+                // If it's a fatal socket configuration error (SO_MARK or SO_BINDTODEVICE), abort immediately!
+                // Security isolation errors MUST NOT fall through to retries.
+                if e.downcast_ref::<IsolationError>().is_some() {
+                    return Err(e);
+                }
+                tracing::warn!("Connection candidate {} failed: {}", idx, e);
+                last_err = Some(e);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Connection candidate {} timed out after {:?}",
+                    idx,
+                    attempt_timeout
+                );
+                last_err = Some(anyhow!("TCP connect timeout for candidate {}", idx));
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("All connection attempts failed")))
+}
+
+/// Internal primitive: creates a socket, applies SO_MARK and SO_BINDTODEVICE strictly,
+/// and executes connect. If any isolation option fails, the function aborts before connect().
+async fn connect_isolated_socket(ip: IpAddr, port: u16, ifname: &str) -> Result<TcpStream> {
     let addr = SocketAddr::new(ip, port);
 
     let socket = if ip.is_ipv4() {
@@ -21,75 +154,182 @@ pub async fn connect_tcp(
         TcpSocket::new_v6()?
     };
 
-    // Enable TCP_NODELAY to avoid 40ms delayed-ACK latency
     let _ = socket.set_nodelay(true);
-    // Note: We deliberately do NOT call set_recv_buffer_size / set_send_buffer_size here.
-    // In Linux, manually setting SO_RCVBUF disables kernel dynamic TCP window autotuning (tcp_moderate_rcvbuf),
-    // which artificially caps the Bandwidth-Delay Product (BDP) on high-latency or fast WAN links.
-
-    let ifname = if enforce_remote {
-        match egress_mgr.get_remote_interface() {
-            Some(iface) => iface,
-            None => {
-                return Err(anyhow!(
-                    "REMOTE egress requested but no remote interface is configured"
-                ));
-            }
-        }
-    } else {
-        egress_mgr.get_direct_interface()
-    };
-
     let fd = socket.as_raw_fd();
 
-    // Set SO_MARK to 0x4446 so the nftables rules ignore our own traffic
-    unsafe {
-        let mark: u32 = 0x4446;
-        let _ = libc::setsockopt(
+    apply_socket_isolation(fd, ifname)?;
+
+    // 3. Connect to destination address
+    socket.connect(addr).await.map_err(|e| e.into())
+}
+
+/// Apply both mandatory isolation options in order. Kept as a production helper so
+/// tests can inject syscall outcomes without requiring CAP_NET_ADMIN.
+fn apply_socket_isolation(fd: std::os::fd::RawFd, ifname: &str) -> Result<()> {
+    apply_socket_isolation_with(ifname, |option, value| unsafe {
+        libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
-            libc::SO_MARK,
-            &mark as *const _ as *const libc::c_void,
-            std::mem::size_of::<u32>() as libc::socklen_t,
+            option,
+            value.as_ptr() as *const libc::c_void,
+            value.len() as libc::socklen_t,
+        )
+    })
+}
+
+#[doc(hidden)]
+pub fn apply_socket_isolation_with(
+    ifname: &str,
+    mut set_option: impl FnMut(libc::c_int, &[u8]) -> libc::c_int,
+) -> Result<()> {
+    let mark = DFLUX_SO_MARK.to_ne_bytes();
+    if set_option(libc::SO_MARK, &mark) != 0 {
+        return Err(IsolationError::SoMark(std::io::Error::last_os_error()).into());
+    }
+    if ifname.trim().is_empty() {
+        return Err(anyhow!("Cannot bind socket: interface name is empty"));
+    }
+    let mut interface = ifname.as_bytes().to_vec();
+    interface.push(0);
+    if set_option(libc::SO_BINDTODEVICE, &interface) != 0 {
+        return Err(IsolationError::BindToDevice(std::io::Error::last_os_error()).into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn mark_failure_stops_before_bind_or_connect() {
+        let calls = RefCell::new(Vec::new());
+        let result = apply_socket_isolation_with("eth-test", |option, _| {
+            calls.borrow_mut().push(option);
+            unsafe { *libc::__errno_location() = libc::EPERM };
+            -1
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<IsolationError>()
+                .is_some()
         );
+        assert_eq!(*calls.borrow(), vec![libc::SO_MARK]);
     }
 
-    // Bind to the correct interface (remote or direct if specified)
-    if !ifname.is_empty() {
-        let mut ifname_bytes = ifname.as_bytes().to_vec();
-        ifname_bytes.push(0); // null-terminate
-        unsafe {
-            let ret = libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_BINDTODEVICE,
-                ifname_bytes.as_ptr() as *const libc::c_void,
-                ifname_bytes.len() as libc::socklen_t,
-            );
-            if ret != 0 {
-                if enforce_remote {
-                    return Err(anyhow!(
-                        "Failed to bind remote egress to {}: {} (requires CAP_NET_RAW)",
-                        ifname,
-                        std::io::Error::last_os_error()
-                    ));
-                } else {
-                    // Direct interface: if SO_BINDTODEVICE fails, standard routing table applies
-                    tracing::debug!(
-                        "SO_BINDTODEVICE on direct interface {} failed, using default route",
-                        ifname
-                    );
-                }
+    #[test]
+    fn bind_failure_stops_before_connect() {
+        let calls = RefCell::new(Vec::new());
+        let result = apply_socket_isolation_with("eth-test", |option, _| {
+            calls.borrow_mut().push(option);
+            if option == libc::SO_BINDTODEVICE {
+                unsafe { *libc::__errno_location() = libc::EPERM };
+                -1
+            } else {
+                0
             }
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<IsolationError>()
+                .is_some()
+        );
+        assert_eq!(*calls.borrow(), vec![libc::SO_MARK, libc::SO_BINDTODEVICE]);
+    }
+
+    fn manager() -> Arc<EgressManager> {
+        use crate::config::EgressConfig;
+        use crate::egress::NetworkInterfaceEgress;
+        Arc::new(EgressManager::new(
+            Arc::new(EgressConfig {
+                direct_interface: "dir0".into(),
+                remote_interface: Some("rem0".into()),
+            }),
+            Some(Arc::new(NetworkInterfaceEgress::new("rem0".into()))),
+        ))
+    }
+
+    #[tokio::test]
+    async fn real_candidate_flow_aborts_on_mark_and_bind_errors() {
+        for fail_option in [libc::SO_MARK, libc::SO_BINDTODEVICE] {
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = calls.clone();
+            let ips = ["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
+            let result: Result<()> =
+                connect_tcp_candidates_with(&ips, 443, false, manager(), move |ip, _, _| {
+                    let log = log.clone();
+                    Box::pin(async move {
+                        log.lock().unwrap().push(format!("socket:{ip}"));
+                        let isolation = apply_socket_isolation_with("dir0", |option, _| {
+                            log.lock().unwrap().push(format!("option:{option}"));
+                            if option == fail_option {
+                                unsafe { *libc::__errno_location() = libc::EPERM };
+                                -1
+                            } else {
+                                0
+                            }
+                        });
+                        isolation?;
+                        log.lock().unwrap().push("connect".into());
+                        Err(anyhow!("unexpected"))
+                    })
+                })
+                .await;
+            assert!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<IsolationError>()
+                    .is_some()
+            );
+            let observed = calls.lock().unwrap().clone();
+            assert_eq!(
+                observed.iter().filter(|s| s.starts_with("socket:")).count(),
+                1
+            );
+            assert!(!observed.iter().any(|s| s == "connect"));
         }
     }
 
-    match timeout(Duration::from_secs(3), socket.connect(addr)).await {
-        Ok(Ok(stream)) => {
-            let _ = stream.set_nodelay(true);
-            Ok(stream)
-        }
-        Ok(Err(e)) => Err(e.into()),
-        Err(_) => Err(anyhow!("TCP connect timeout")),
+    #[tokio::test]
+    async fn real_candidate_flow_retries_tcp_errors_with_one_budget() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = calls.clone();
+        let ips = ["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
+        let result = connect_tcp_candidates_with(&ips, 443, false, manager(), move |ip, _, _| {
+            let log = log.clone();
+            Box::pin(async move {
+                log.lock().unwrap().push(ip);
+                if ip == ips[0] {
+                    Err(std::io::Error::from_raw_os_error(libc::ECONNREFUSED).into())
+                } else {
+                    Ok(ip)
+                }
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, ips[1]);
+        assert_eq!(*calls.lock().unwrap(), ips);
+    }
+
+    #[tokio::test]
+    async fn real_candidate_flow_stops_after_first_success() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = calls.clone();
+        let ips = ["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
+        let result = connect_tcp_candidates_with(&ips, 443, false, manager(), move |ip, _, _| {
+            let log = log.clone();
+            Box::pin(async move {
+                log.lock().unwrap().push(ip);
+                Ok(ip)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, ips[0]);
+        assert_eq!(*calls.lock().unwrap(), vec![ips[0]]);
     }
 }

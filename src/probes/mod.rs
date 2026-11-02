@@ -98,7 +98,7 @@ pub async fn run_probe_silent_port(
         error_reason: None,
     };
 
-    let ips = match dns::resolve(hostname).await {
+    let ips = match dns::resolve(hostname, remote, egress_mgr.clone()).await {
         Ok(ips) => ips,
         Err(e) => {
             report.error_reason = Some(format!("DNS_FAIL: {}", e));
@@ -151,7 +151,7 @@ pub async fn run_probe_silent_port(
 
 pub async fn run_probe(hostname: &str, remote: bool, egress_mgr: Arc<EgressManager>) -> Result<()> {
     println!("DNS:");
-    let ips = match dns::resolve(hostname).await {
+    let ips = match dns::resolve(hostname, remote, egress_mgr.clone()).await {
         Ok(ips) => {
             println!("  PASS");
             for ip in &ips {

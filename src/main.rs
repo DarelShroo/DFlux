@@ -115,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
                 println!(
                     "WARNING: Running ENFORCE mode. DFlux will intercept system traffic transparently."
                 );
-                let routing_engine = RoutingEngine::new(
+                let mut routing_engine = RoutingEngine::new(
                     config.gateway.port,
                     config.egress.direct_interface.clone(),
                     config.egress.remote_interface.clone(),

@@ -10,7 +10,6 @@ ctrlc = "3.5.2"
 dotenvy = "0.15"
 hickory-resolver = "0.26.3"
 libc = "0.2.189"
-reqwest = { version = "0.13.5", features = ["default-tls", "hickory-dns", "stream", "json"] }
 rustls = "0.23.45"
 rustls-pki-types = "1.15.1"
 serde = { version = "1.0.229", features = ["derive"] }
