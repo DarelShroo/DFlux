@@ -151,9 +151,11 @@ impl DnsCache {
         if let Some(lock) = self.flights.read().await.get(&key) {
             return lock.clone();
         }
-        self.flights
-            .write()
-            .await
+        let mut flights = self.flights.write().await;
+        if flights.len() > 2000 {
+            flights.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+        flights
             .entry(key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
@@ -187,13 +189,29 @@ pub async fn resolve(
     let hostname = hostname.to_string();
     let lookup_key = hostname.clone();
     let transport_mgr = egress_mgr.clone();
-    resolve_cached(
+    let result = resolve_cached(
         &DNS_CACHE,
         &lookup_key,
         enforce_remote,
         move || async move {
-            // Generate random 16-bit query ID
-            let query_id: u16 = (Instant::now().elapsed().as_nanos() & 0xFFFF) as u16 ^ 0x5A5A;
+            // Use kernel entropy; Instant::now().elapsed() is almost always near zero and
+            // would otherwise make the transaction ID effectively constant.
+            let mut id_bytes = [0u8; 2];
+            let count = unsafe {
+                libc::getrandom(
+                    id_bytes.as_mut_ptr() as *mut libc::c_void,
+                    id_bytes.len(),
+                    0,
+                )
+            };
+            if count != id_bytes.len() as isize {
+                let fallback = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos()
+                    ^ std::process::id() as u128;
+                id_bytes.copy_from_slice(&(fallback as u16).to_be_bytes());
+            }
+            let query_id = u16::from_be_bytes(id_bytes);
             let query_wire = build_dns_query(&hostname, query_id)?;
             run_doh_attempts(
                 GLOBAL_DOH_TIMEOUT,
@@ -229,7 +247,16 @@ pub async fn resolve(
             .await
         },
     )
-    .await
+    .await;
+    match &result {
+        Ok(ips) => {
+            tracing::debug!(hostname = %lookup_key, route = if enforce_remote { "REMOTE" } else { "DIRECT" }, addresses = ?ips, "DoH resolution completed")
+        }
+        Err(error) => {
+            tracing::warn!(hostname = %lookup_key, route = if enforce_remote { "REMOTE" } else { "DIRECT" }, error = %error, "DoH resolution failed")
+        }
+    }
+    result
 }
 
 /// Runs one policy-scoped lookup through the same cache and single-flight path used by DoH.
@@ -250,12 +277,14 @@ where
     if let Some(cached_ips) = cache.get(hostname, remote).await {
         return Ok(cached_ips);
     }
-    let resolved = transport().await?;
-    if resolved.is_empty() {
-        return Err(anyhow!("DoH returned no addresses"));
+    let result = transport().await;
+    if let Ok(resolved) = &result {
+        if resolved.is_empty() {
+            return Err(anyhow!("DoH returned no addresses"));
+        }
+        cache.insert(hostname, remote, resolved.clone()).await;
     }
-    cache.insert(hostname, remote, resolved.clone()).await;
-    Ok(resolved)
+    result
 }
 
 #[doc(hidden)]

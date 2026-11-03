@@ -281,6 +281,27 @@ fn test_netns_real_routing_rollback_preserves_third_party() {
                 .unwrap()
                 .success()
         );
+        let dflux_table = Command::new("nft")
+            .args(["list", "table", "ip", "dflux"])
+            .output()
+            .unwrap();
+        let dflux_rules = String::from_utf8_lossy(&dflux_table.stdout);
+        assert!(
+            dflux_rules.contains("redirect to :12345"),
+            "local output path must redirect to transparent listener"
+        );
+        assert!(
+            !dflux_rules.contains("masquerade"),
+            "DFlux must not NAT unrelated interface traffic"
+        );
+        assert!(
+            Command::new("nft")
+                .args(["list", "table", "ip6", "dflux6"])
+                .status()
+                .unwrap()
+                .success(),
+            "unsupported IPv6 web traffic must be fail-closed"
+        );
         let third_party_route = Command::new("ip")
             .args(["route", "show", "198.18.77.0/24", "table", "200"])
             .output()
@@ -325,6 +346,14 @@ fn test_netns_real_routing_rollback_preserves_third_party() {
                 .success()
         );
         assert!(
+            !Command::new("nft")
+                .args(["list", "table", "ip6", "dflux6"])
+                .status()
+                .unwrap()
+                .success(),
+            "DFlux IPv6 guard must be removed on rollback"
+        );
+        assert!(
             Command::new("nft")
                 .args(["list", "table", "ip", "third_party"])
                 .status()
@@ -367,5 +396,121 @@ fn test_netns_real_routing_rollback_preserves_third_party() {
         "real RoutingEngine namespace rollback failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Verifies local OUTPUT redirect and original destination recovery in a disposable namespace.
+/// It must only be run through unshare; it never installs rules in the development host.
+#[test]
+#[ignore = "requires unshare user/network namespaces, CAP_NET_ADMIN, nftables and iproute2"]
+fn test_netns_local_output_redirect_preserves_destination() {
+    if std::env::var_os("DFLUX_REDIRECT_NETNS_CHILD").is_some() {
+        use dflux::routing::RoutingEngine;
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        assert!(
+            Command::new("ip")
+                .args(["link", "set", "lo", "up"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("ip")
+                .args(["route", "add", "198.18.0.0/15", "dev", "lo"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let run_dir = std::env::temp_dir().join(format!("dflux-redirect-{}", std::process::id()));
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let listener = std::net::TcpListener::bind("0.0.0.0:12345").unwrap();
+        listener.set_nonblocking(false).unwrap();
+        let mut engine = RoutingEngine::new_with_run_dir(
+            12345,
+            "lo".into(),
+            None,
+            "127.0.0.0/8".into(),
+            run_dir.clone(),
+        );
+        engine.start().expect("isolated routing initialization");
+
+        let server = std::thread::spawn(move || {
+            let (mut accepted, _) = listener.accept().unwrap();
+            accepted
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0u8; 128];
+            let count = accepted.read(&mut request).unwrap();
+            assert!(
+                std::str::from_utf8(&request[..count])
+                    .unwrap()
+                    .contains("Host: e2e.example")
+            );
+            let mut original: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut length = std::mem::size_of_val(&original) as libc::socklen_t;
+            let result = unsafe {
+                libc::getsockopt(
+                    accepted.as_raw_fd(),
+                    libc::SOL_IP,
+                    80,
+                    &mut original as *mut _ as *mut libc::c_void,
+                    &mut length,
+                )
+            };
+            assert_eq!(
+                result, 0,
+                "SO_ORIGINAL_DST must be available after local REDIRECT"
+            );
+            assert_eq!(
+                std::net::Ipv4Addr::from(original.sin_addr.s_addr.to_ne_bytes()),
+                "198.18.1.1".parse::<std::net::Ipv4Addr>().unwrap()
+            );
+            assert_eq!(u16::from_be(original.sin_port), 443);
+        });
+
+        let mut client = std::net::TcpStream::connect_timeout(
+            &"198.18.1.1:443".parse().unwrap(),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: e2e.example\r\n\r\n")
+            .unwrap();
+        server.join().unwrap();
+        engine.stop().unwrap();
+        drop(engine);
+        std::fs::remove_dir_all(run_dir).unwrap();
+        return;
+    }
+
+    let binary = std::env::current_exe().expect("integration test executable path");
+    let result = Command::new("unshare")
+        .args([
+            "-U",
+            "-n",
+            "--map-root-user",
+            "env",
+            "DFLUX_REDIRECT_NETNS_CHILD=1",
+        ])
+        .arg(binary)
+        .args([
+            "--ignored",
+            "--exact",
+            "test_netns_local_output_redirect_preserves_destination",
+            "--nocapture",
+        ])
+        .output()
+        .expect("launch isolated local redirect test");
+    assert!(
+        result.status.success(),
+        "local redirect namespace test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
     );
 }

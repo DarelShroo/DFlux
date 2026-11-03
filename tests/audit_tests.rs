@@ -211,6 +211,21 @@ async fn test_route_flapping_prevention_and_success_reset() {
 }
 
 #[tokio::test]
+async fn test_remote_route_failure_expires_and_valid_probe_can_restore_direct() {
+    let sm = StateManager::new(1800);
+    let host = "route-recovery.test";
+    sm.record_route_success(host, Decision::Remote).await;
+    assert_eq!(sm.get_decision(host).await, Some(Decision::Remote));
+    sm.record_failure(host).await;
+    sm.record_failure(host).await;
+    assert_eq!(sm.get_decision(host).await, Some(Decision::Remote));
+    sm.record_failure(host).await;
+    assert_eq!(sm.get_decision(host).await, None);
+    sm.record_route_success(host, Decision::Direct).await;
+    assert_eq!(sm.get_decision(host).await, Some(Decision::Direct));
+}
+
+#[tokio::test]
 async fn test_doh_failure_is_returned_without_network() {
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();

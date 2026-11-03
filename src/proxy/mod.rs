@@ -84,6 +84,10 @@ async fn handle_client(
         })
         .await;
 
+    tracing::info!(hostname = %host, calculated_policy = ?decision,
+        applied_policy = if mode == "observe" { "DIRECT" } else if decision == Decision::Remote { "REMOTE" } else { "DIRECT" },
+        mode = %mode, "proxy route policy selected");
+
     let mut server_stream = match proxy_connect(
         &mode,
         decision,
@@ -138,12 +142,7 @@ async fn handle_client(
     )
     .await
     {
-        Ok((from_client, from_server)) => {
-            if from_server > 0 || from_client > 0 {
-                state_manager.record_success(&host).await;
-            }
-            Ok(())
-        }
+        Ok((_from_client, _from_server)) => Ok(()),
         Err(e) => {
             state_manager.record_failure(&host).await;
             Err(e.into())

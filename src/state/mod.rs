@@ -66,8 +66,13 @@ impl StateManager {
         let ttl = if failed {
             let backoff = 15 * (2_u64.pow(failures.min(4)));
             Duration::from_secs(backoff)
+        } else if decision == Decision::Remote {
+            // A remote route is periodically rechecked so recovery to DIRECT is prompt.
+            Duration::from_secs(self.base_ttl.as_secs().min(120))
         } else {
-            self.base_ttl
+            // Avoid retaining a clean DIRECT result for the daemon's full 30-minute lifetime;
+            // hostile routing conditions can change while a client session is active.
+            Duration::from_secs(self.base_ttl.as_secs().min(300))
         };
 
         cache.insert(
@@ -139,11 +144,17 @@ impl StateManager {
         let mut cache = self.cache.write().await;
         if let Some(state) = cache.get_mut(hostname) {
             state.failures += 1;
-            if state.failures >= 3 && state.decision == Decision::Direct {
-                // Demote from Direct or expire early to force re-evaluation
+            if state.failures >= 3 {
+                // Both policies can become unhealthy; force a fresh independent evaluation.
                 state.expires_at = Instant::now();
             }
         }
+    }
+
+    /// Records the route which actually established the client connection. A successful
+    /// fallback supersedes a stale preflight decision immediately.
+    pub async fn record_route_success(&self, hostname: &str, decision: Decision) {
+        self.set_decision(hostname, decision, false).await;
     }
 
     /// Reports successful data transfer on a route to reset failure counters.

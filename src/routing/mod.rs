@@ -77,10 +77,21 @@ impl RoutingEngine {
 
     /// Sets up transparent proxy rules using nftables TPROXY with pre-validation and rollback tracking.
     pub fn start(&mut self) -> Result<()> {
-        if self.direct_iface.trim().is_empty() {
-            return Err(anyhow!("direct_interface is required and cannot be empty"));
+        if self.direct_iface.trim().is_empty()
+            || !Path::new("/sys/class/net")
+                .join(&self.direct_iface)
+                .exists()
+        {
+            return Err(anyhow!(
+                "DIRECT interface '{}' does not exist",
+                self.direct_iface
+            ));
         }
-
+        if let Some(remote) = &self.remote_iface
+            && (remote.trim().is_empty() || !Path::new("/sys/class/net").join(remote).exists())
+        {
+            return Err(anyhow!("REMOTE interface '{}' does not exist", remote));
+        }
         println!("Starting Routing Engine (nftables TPROXY)...");
 
         // 1. Acquire exclusive lockfile in protected directory
@@ -89,13 +100,8 @@ impl RoutingEngine {
         // 2. Pre-inspection: Check for conflicting pre-existing resources
         self.check_preexisting_conflicts()?;
 
-        // 3. Enable IP forwarding
-        Self::run_cmd_checked(
-            Command::new("sysctl").args(["-w", "net.ipv4.ip_forward=1"]),
-            "Enable IP forwarding (sysctl net.ipv4.ip_forward=1)",
-        )?;
-
-        // 4. Initialize deployment state tracking
+        // 3. Initialize deployment state tracking. TPROXY terminates connections locally, so
+        // forwarding and broad postrouting NAT are not needed and are deliberately untouched.
         let uuid = format!(
             "{:016x}",
             std::time::SystemTime::now()
@@ -119,17 +125,9 @@ impl RoutingEngine {
 
         // 5. Step 1: Apply nftables table
         let rules = format!(
-            "table ip dflux {{\n    chain prerouting {{\n        type filter hook prerouting priority mangle; policy accept;\n        # Exclude private subnets and loopback to prevent intercepting LAN/router traffic\n        ip daddr {{ {exclude_subnets} }} accept\n        \n        # Catch forwarded LAN traffic and locally re-routed traffic\n        tcp dport {{ 80, 443 }} tproxy to :{port} meta mark set 1 accept\n    }}\n    chain output {{\n        type route hook output priority mangle; policy accept;\n        # Exclude DFlux's own traffic (marked with 0x4446)\n        meta mark 0x4446 accept\n        \n        # Exclude private subnets and loopback\n        ip daddr {{ {exclude_subnets} }} accept\n        \n        # Intercept locally generated traffic and mark it to force routing to 'lo'\n        tcp dport {{ 80, 443 }} meta mark set 1 accept\n    }}\n    chain postrouting {{\n        type nat hook postrouting priority srcnat; policy accept;\n        # Exclude private subnets from masquerading to prevent breaking local routed traffic\n        ip daddr {{ {exclude_subnets} }} return\n\n        # Masquerade traffic leaving through managed interfaces\n        oifname \"{direct_iface}\" masquerade\n        {remote_masq}\n    }}\n}}",
+            "table ip dflux {{\n    chain prerouting {{\n        type filter hook prerouting priority mangle; policy accept;\n        ip daddr {{ {exclude_subnets} }} accept\n        tcp dport {{ 80, 443 }} tproxy to :{port} meta mark set 1 accept\n    }}\n    chain output_route {{\n        type route hook output priority mangle; policy accept;\n        meta mark 0x4446 accept\n        ip daddr {{ {exclude_subnets} }} accept\n    }}\n    chain output_nat {{\n        type nat hook output priority dstnat; policy accept;\n        meta mark 0x4446 return\n        ip daddr {{ {exclude_subnets} }} return\n        tcp dport {{ 80, 443 }} redirect to :{port}\n    }}\n}}\ntable ip6 dflux6 {{\n    chain prerouting {{ type filter hook prerouting priority mangle; policy accept; tcp dport {{ 80, 443 }} reject; }}\n    chain output {{ type filter hook output priority mangle; policy accept; tcp dport {{ 80, 443 }} reject; }}\n}}",
             port = self.port,
-            direct_iface = self.direct_iface,
             exclude_subnets = self.exclude_subnets,
-            remote_masq = self
-                .remote_iface
-                .as_ref()
-                .map_or("".to_string(), |iface| format!(
-                    "oifname \"{}\" masquerade",
-                    iface
-                ))
         );
 
         let mut child = Command::new("nft")
@@ -212,7 +210,15 @@ impl RoutingEngine {
                 Command::new("nft").args(["delete", "table", "ip", "dflux"]),
                 "Delete nftables table ip dflux",
             );
-            if res.is_ok() {
+            let v6_res = if Self::verify_nft6_ownership()? {
+                Self::run_cmd_checked(
+                    Command::new("nft").args(["delete", "table", "ip6", "dflux6"]),
+                    "Delete nftables table ip6 dflux6",
+                )
+            } else {
+                Ok(String::new())
+            };
+            if res.is_ok() && v6_res.is_ok() {
                 self.created_nft.store(false, Ordering::SeqCst);
                 if let Some(ref mut st) = loaded_state {
                     st.nft_active = false;
@@ -287,6 +293,13 @@ impl RoutingEngine {
         use std::os::fd::FromRawFd;
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        if !self.run_dir.exists() {
+            let _ = fs::create_dir_all(&self.run_dir);
+            let _ = fs::set_permissions(&self.run_dir, fs::Permissions::from_mode(0o700));
+        }
+
         let dir_path = std::ffi::CString::new(self.run_dir.as_os_str().as_bytes())?;
         let dir_fd = unsafe {
             libc::open(
@@ -367,6 +380,16 @@ impl RoutingEngine {
             ));
         }
 
+        if let Ok(output) = Command::new("nft")
+            .args(["list", "table", "ip6", "dflux6"])
+            .output()
+            && output.status.success()
+        {
+            return Err(anyhow!(
+                "Conflict detected: nftables table 'ip6 dflux6' already exists on the system"
+            ));
+        }
+
         // Check ip rule pref 32000
         if let Ok(output) = Command::new("ip")
             .args(["rule", "show", "pref", "32000"])
@@ -412,6 +435,24 @@ impl RoutingEngine {
             Ok(true)
         } else {
             eprintln!("Refusing to delete 'table ip dflux': table does not match DFlux signature");
+            Ok(false)
+        }
+    }
+
+    pub fn verify_nft6_ownership() -> Result<bool> {
+        let output = Command::new("nft")
+            .args(["list", "table", "ip6", "dflux6"])
+            .output()?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        if text.contains("reject") && text.contains("dflux6") {
+            Ok(true)
+        } else {
+            eprintln!(
+                "Refusing to delete 'table ip6 dflux6': table does not match DFlux signature"
+            );
             Ok(false)
         }
     }

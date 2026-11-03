@@ -4,12 +4,46 @@ pub mod tls;
 
 use anyhow::Result;
 
+#[derive(Clone, Debug)]
 pub struct ProbeReport {
     pub dns_pass: bool,
     pub tcp_pass: bool,
     pub tls_pass: bool,
     pub cert_valid: bool,
     pub error_reason: Option<String>,
+    pub failure_kind: Option<ProbeFailureKind>,
+    pub certificate_subject: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeFailureKind {
+    Dns,
+    EmptyDns,
+    Tcp,
+    Timeout,
+    TlsNameMismatch,
+    TlsUntrusted,
+    TlsExpired,
+    TlsChain,
+    TlsHandshake,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecisionReason {
+    DirectProbePassed,
+    DirectTlsRejectedRemotePassed,
+    DirectNetworkFailedRemotePassed,
+    BothRoutesFailed,
+    RemoteUnavailable,
+}
+
+#[derive(Clone, Debug)]
+pub struct RouteEvaluation {
+    pub decision: Decision,
+    pub reason: DecisionReason,
+    pub direct: ProbeReport,
+    pub remote: Option<ProbeReport>,
+    pub failed: bool,
 }
 
 use crate::egress::EgressManager;
@@ -22,9 +56,27 @@ pub async fn evaluate_route(
     port: u16,
     egress_mgr: Arc<EgressManager>,
 ) -> (Decision, bool) {
+    let evaluation = evaluate_route_detailed(target_host, port, egress_mgr).await;
+    (evaluation.decision, evaluation.failed)
+}
+
+pub async fn evaluate_route_detailed(
+    target_host: &str,
+    port: u16,
+    egress_mgr: Arc<EgressManager>,
+) -> RouteEvaluation {
     // 1. If remote interface is not configured, direct is the only choice
     if egress_mgr.get_remote_interface().is_none() {
-        return (Decision::Direct, false);
+        let report = run_probe_silent_port(target_host, port, false, egress_mgr)
+            .await
+            .unwrap_or_else(|e| failed_report(ProbeFailureKind::Tcp, e.to_string()));
+        return RouteEvaluation {
+            decision: Decision::Direct,
+            reason: DecisionReason::RemoteUnavailable,
+            direct: report,
+            remote: None,
+            failed: false,
+        };
     }
 
     // 2. Optimistic Direct-first probe: test Direct with a 2-second timeout
@@ -34,20 +86,19 @@ pub async fn evaluate_route(
     )
     .await;
 
-    let direct_ok = match direct_probe {
-        Ok(Ok(ref report)) => {
-            if port == 443 {
-                report.cert_valid
-            } else {
-                report.tcp_pass
-            }
-        }
-        _ => false,
+    let direct_report = match &direct_probe {
+        Ok(Ok(report)) => report.clone(),
+        Ok(Err(error)) => failed_report(ProbeFailureKind::Tcp, error.to_string()),
+        Err(_) => failed_report(ProbeFailureKind::Timeout, "DIRECT probe timed out".into()),
     };
+    let direct_ok = probe_passed(&direct_report, port);
 
     // If Direct route works, NEVER waste time/resources probing Remote!
     if direct_ok {
-        return (Decision::Direct, false);
+        let evaluation = evaluate_probe_reports(port, direct_report, None);
+        tracing::info!(hostname = target_host, selected = "DIRECT", reason = ?evaluation.reason,
+            "route probe selected DIRECT");
+        return evaluation;
     }
 
     // 3. Direct route failed or has invalid certificate/poisoning: test Remote
@@ -57,22 +108,93 @@ pub async fn evaluate_route(
     )
     .await;
 
-    let remote_ok = match remote_probe {
-        Ok(Ok(ref report)) => {
-            if port == 443 {
-                report.cert_valid
-            } else {
-                report.tcp_pass
-            }
-        }
-        _ => false,
+    let remote_report = match &remote_probe {
+        Ok(Ok(report)) => report.clone(),
+        Ok(Err(error)) => failed_report(ProbeFailureKind::Tcp, error.to_string()),
+        Err(_) => failed_report(ProbeFailureKind::Timeout, "REMOTE probe timed out".into()),
     };
+    let evaluation = evaluate_probe_reports(port, direct_report, Some(remote_report));
+    tracing::info!(hostname = target_host, selected = ?evaluation.decision, reason = ?evaluation.reason,
+        direct_failure = ?evaluation.direct.failure_kind,
+        direct_certificate = ?evaluation.direct.certificate_subject,
+        remote_failure = ?evaluation.remote.as_ref().and_then(|r| r.failure_kind),
+        remote_certificate = ?evaluation.remote.as_ref().and_then(|r| r.certificate_subject.as_deref()),
+        "route probe decision completed");
+    evaluation
+}
 
-    if remote_ok {
-        (Decision::Remote, false)
+pub fn evaluate_probe_reports(
+    port: u16,
+    direct: ProbeReport,
+    remote: Option<ProbeReport>,
+) -> RouteEvaluation {
+    if probe_passed(&direct, port) {
+        return RouteEvaluation {
+            decision: Decision::Direct,
+            reason: DecisionReason::DirectProbePassed,
+            direct,
+            remote,
+            failed: false,
+        };
+    }
+    let Some(remote_report) = remote else {
+        return RouteEvaluation {
+            decision: Decision::Direct,
+            reason: DecisionReason::RemoteUnavailable,
+            direct,
+            remote: None,
+            failed: false,
+        };
+    };
+    if probe_passed(&remote_report, port) {
+        let tls_rejection = matches!(
+            direct.failure_kind,
+            Some(
+                ProbeFailureKind::TlsNameMismatch
+                    | ProbeFailureKind::TlsUntrusted
+                    | ProbeFailureKind::TlsExpired
+                    | ProbeFailureKind::TlsChain
+            )
+        );
+        RouteEvaluation {
+            decision: Decision::Remote,
+            reason: if tls_rejection {
+                DecisionReason::DirectTlsRejectedRemotePassed
+            } else {
+                DecisionReason::DirectNetworkFailedRemotePassed
+            },
+            direct,
+            remote: Some(remote_report),
+            failed: false,
+        }
     } else {
-        // Both failed: fallback to Direct with failure flag (triggers exponential backoff)
-        (Decision::Direct, true)
+        RouteEvaluation {
+            decision: Decision::Direct,
+            reason: DecisionReason::BothRoutesFailed,
+            direct,
+            remote: Some(remote_report),
+            failed: true,
+        }
+    }
+}
+
+fn failed_report(kind: ProbeFailureKind, reason: String) -> ProbeReport {
+    ProbeReport {
+        dns_pass: false,
+        tcp_pass: false,
+        tls_pass: false,
+        cert_valid: false,
+        error_reason: Some(reason),
+        failure_kind: Some(kind),
+        certificate_subject: None,
+    }
+}
+
+fn probe_passed(report: &ProbeReport, port: u16) -> bool {
+    if port == 443 {
+        report.cert_valid
+    } else {
+        report.tcp_pass
     }
 }
 
@@ -96,12 +218,15 @@ pub async fn run_probe_silent_port(
         tls_pass: false,
         cert_valid: false,
         error_reason: None,
+        failure_kind: None,
+        certificate_subject: None,
     };
 
     let ips = match dns::resolve(hostname, remote, egress_mgr.clone()).await {
         Ok(ips) => ips,
         Err(e) => {
             report.error_reason = Some(format!("DNS_FAIL: {}", e));
+            report.failure_kind = Some(ProbeFailureKind::Dns);
             return Ok(report);
         }
     };
@@ -109,6 +234,7 @@ pub async fn run_probe_silent_port(
 
     if ips.is_empty() {
         report.error_reason = Some("DNS_FAIL_NO_IPS".to_string());
+        report.failure_kind = Some(ProbeFailureKind::EmptyDns);
         return Ok(report);
     }
 
@@ -120,6 +246,7 @@ pub async fn run_probe_silent_port(
         }
         Err(e) => {
             report.error_reason = Some(format!("TCP_FAIL: {}", e));
+            report.failure_kind = Some(ProbeFailureKind::Tcp);
             return Ok(report);
         }
     }
@@ -132,13 +259,43 @@ pub async fn run_probe_silent_port(
             }
             Err(tls::TlsError::HostnameMismatch {
                 expected: _,
-                received: _,
+                received,
             }) => {
                 report.tls_pass = true;
                 report.error_reason = Some("CERTIFICATE_HOSTNAME_MISMATCH".to_string());
+                report.failure_kind = Some(ProbeFailureKind::TlsNameMismatch);
+                report.certificate_subject = Some(received);
+            }
+            Err(tls::TlsError::UntrustedCertificate { subject }) => {
+                report.error_reason = Some("CERTIFICATE_UNTRUSTED".into());
+                report.failure_kind = Some(ProbeFailureKind::TlsUntrusted);
+                report.certificate_subject = Some(subject);
+            }
+            Err(tls::TlsError::ExpiredCertificate { subject }) => {
+                report.error_reason = Some("CERTIFICATE_EXPIRED".into());
+                report.failure_kind = Some(ProbeFailureKind::TlsExpired);
+                report.certificate_subject = Some(subject);
+            }
+            Err(tls::TlsError::IncompleteChain { subject }) => {
+                report.error_reason = Some("CERTIFICATE_CHAIN_INCOMPLETE".into());
+                report.failure_kind = Some(ProbeFailureKind::TlsChain);
+                report.certificate_subject = Some(subject);
+            }
+            Err(tls::TlsError::TcpConnect(reason)) => {
+                report.error_reason = Some(format!("TLS probe TCP connect failed: {reason}"));
+                report.failure_kind = Some(ProbeFailureKind::Tcp);
+            }
+            Err(tls::TlsError::HandshakeTimeout) => {
+                report.error_reason = Some("TLS_HANDSHAKE_TIMEOUT".into());
+                report.failure_kind = Some(ProbeFailureKind::Timeout);
+            }
+            Err(tls::TlsError::HandshakeFailure(reason)) => {
+                report.error_reason = Some(format!("TLS_HANDSHAKE_FAILED: {reason}"));
+                report.failure_kind = Some(ProbeFailureKind::TlsHandshake);
             }
             Err(e) => {
                 report.error_reason = Some(format!("TLS_FAIL: {}", e));
+                report.failure_kind = Some(ProbeFailureKind::TlsHandshake);
             }
         }
     } else {
@@ -256,4 +413,69 @@ pub async fn run_probe_compare(hostname: &str, egress_mgr: Arc<EgressManager>) -
     println!("  {}", decision);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod route_evaluation_tests {
+    use super::*;
+
+    fn report(
+        valid: bool,
+        failure_kind: Option<ProbeFailureKind>,
+        subject: Option<&str>,
+    ) -> ProbeReport {
+        ProbeReport {
+            dns_pass: true,
+            tcp_pass: true,
+            tls_pass: valid,
+            cert_valid: valid,
+            error_reason: None,
+            failure_kind,
+            certificate_subject: subject.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn unexpected_direct_certificate_and_valid_remote_select_remote() {
+        let evaluation = evaluate_probe_reports(
+            443,
+            report(
+                false,
+                Some(ProbeFailureKind::TlsNameMismatch),
+                Some("CN=core1.netops.test"),
+            ),
+            Some(report(true, None, Some("CN=wolftorrent.com"))),
+        );
+        assert_eq!(evaluation.decision, Decision::Remote);
+        assert_eq!(
+            evaluation.reason,
+            DecisionReason::DirectTlsRejectedRemotePassed
+        );
+        assert_eq!(
+            evaluation.direct.certificate_subject.as_deref(),
+            Some("CN=core1.netops.test")
+        );
+    }
+
+    #[test]
+    fn direct_valid_wins_even_when_dns_answers_may_differ() {
+        let evaluation = evaluate_probe_reports(
+            443,
+            report(true, None, None),
+            Some(report(true, None, None)),
+        );
+        assert_eq!(evaluation.decision, Decision::Direct);
+        assert_eq!(evaluation.reason, DecisionReason::DirectProbePassed);
+    }
+
+    #[test]
+    fn both_failed_is_marked_for_short_reevaluation() {
+        let evaluation = evaluate_probe_reports(
+            443,
+            report(false, Some(ProbeFailureKind::Tcp), None),
+            Some(report(false, Some(ProbeFailureKind::Timeout), None)),
+        );
+        assert_eq!(evaluation.decision, Decision::Direct);
+        assert!(evaluation.failed);
+    }
 }

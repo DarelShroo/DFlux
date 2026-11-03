@@ -20,6 +20,58 @@ pub enum IsolationError {
     BindToDevice(#[source] std::io::Error),
 }
 
+#[derive(Debug, Error)]
+pub enum OutboundError {
+    #[error("connection attempt timed out")]
+    Timeout,
+    #[error("invalid egress configuration: {0}")]
+    Configuration(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectFailureClass {
+    Isolation,
+    Configuration,
+    RecoverableNetwork,
+    Other,
+}
+
+/// Classifies connector failures without parsing display strings. Isolation and policy errors
+/// are deliberately never eligible for cross-route fallback.
+pub fn classify_connect_failure(error: &anyhow::Error) -> ConnectFailureClass {
+    if error.downcast_ref::<IsolationError>().is_some() {
+        return ConnectFailureClass::Isolation;
+    }
+    if error
+        .downcast_ref::<OutboundError>()
+        .is_some_and(|e| matches!(e, OutboundError::Configuration(_)))
+    {
+        return ConnectFailureClass::Configuration;
+    }
+    if error
+        .downcast_ref::<OutboundError>()
+        .is_some_and(|e| matches!(e, OutboundError::Timeout))
+    {
+        return ConnectFailureClass::RecoverableNetwork;
+    }
+    let root = error.root_cause();
+    if let Some(io) = root.downcast_ref::<std::io::Error>() {
+        return match io.kind() {
+            std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable => ConnectFailureClass::RecoverableNetwork,
+            _ => ConnectFailureClass::Other,
+        };
+    }
+    ConnectFailureClass::Other
+}
+
 /// Connects to a target TCP destination using a single IP address with strict isolation options.
 pub async fn connect_tcp(
     ip: IpAddr,
@@ -62,24 +114,25 @@ where
     F: FnMut(IpAddr, u16, String) -> Pin<Box<dyn Future<Output = Result<T>> + Send>>,
 {
     if ips.is_empty() {
-        return Err(anyhow!("No IP addresses provided for connection"));
+        return Err(OutboundError::Configuration("no IP addresses provided").into());
     }
 
     let ifname = if enforce_remote {
         match egress_mgr.get_remote_interface() {
             Some(iface) if !iface.trim().is_empty() => iface.to_string(),
             _ => {
-                return Err(anyhow!(
-                    "REMOTE egress requested but no remote interface is configured"
-                ));
+                return Err(
+                    OutboundError::Configuration("REMOTE interface is not configured").into(),
+                );
             }
         }
     } else {
         let direct = egress_mgr.get_direct_interface();
         if direct.trim().is_empty() {
-            return Err(anyhow!(
-                "DIRECT egress requested but direct_interface is empty or not configured"
-            ));
+            return Err(OutboundError::Configuration(
+                "DIRECT interface is empty or not configured",
+            )
+            .into());
         }
         direct.to_string()
     };
@@ -108,7 +161,7 @@ where
     for idx in 0..candidate_count {
         let elapsed = start_time.elapsed();
         if elapsed >= budget {
-            return Err(anyhow!("Global connection timeout ({:?}) exceeded", budget));
+            return Err(OutboundError::Timeout.into());
         }
         let remaining = budget - elapsed;
         let attempt_timeout = if idx == 0 {
@@ -135,7 +188,7 @@ where
                     idx,
                     attempt_timeout
                 );
-                last_err = Some(anyhow!("TCP connect timeout for candidate {}", idx));
+                last_err = Some(OutboundError::Timeout.into());
             }
         }
     }
@@ -187,7 +240,7 @@ pub fn apply_socket_isolation_with(
         return Err(IsolationError::SoMark(std::io::Error::last_os_error()).into());
     }
     if ifname.trim().is_empty() {
-        return Err(anyhow!("Cannot bind socket: interface name is empty"));
+        return Err(OutboundError::Configuration("interface name is empty").into());
     }
     let mut interface = ifname.as_bytes().to_vec();
     interface.push(0);
@@ -250,6 +303,28 @@ mod isolation_tests {
             }),
             Some(Arc::new(NetworkInterfaceEgress::new("rem0".into()))),
         ))
+    }
+
+    #[test]
+    fn classifies_timeout_as_recoverable_and_isolation_as_nonrecoverable() {
+        let timeout = anyhow::Error::new(OutboundError::Timeout);
+        assert_eq!(
+            classify_connect_failure(&timeout),
+            ConnectFailureClass::RecoverableNetwork
+        );
+        let isolation = anyhow::Error::new(IsolationError::SoMark(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+        ));
+        assert_eq!(
+            classify_connect_failure(&isolation),
+            ConnectFailureClass::Isolation
+        );
+        let refused =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert_eq!(
+            classify_connect_failure(&refused),
+            ConnectFailureClass::RecoverableNetwork
+        );
     }
 
     #[tokio::test]

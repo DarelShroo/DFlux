@@ -81,6 +81,44 @@ impl DFluxConfig {
                 self.egress.direct_interface
             ));
         }
+        if let Some(remote) = &self.egress.remote_interface {
+            let remote = remote.trim();
+            if remote.is_empty() || remote.contains('/') || remote == "." || remote == ".." {
+                return Err(anyhow::anyhow!(
+                    "remote_interface must be a valid interface name"
+                ));
+            }
+            if !sysfs.join(remote).exists() {
+                return Err(anyhow::anyhow!(
+                    "remote_interface '{}' does not exist in sysfs",
+                    remote
+                ));
+            }
+        }
+        if self.gateway.port == 0 || self.gateway.proxy_port == 0 {
+            return Err(anyhow::anyhow!("gateway ports must be non-zero"));
+        }
+        for subnet in self.gateway.exclude_subnets.split(',') {
+            let subnet = subnet.trim();
+            let Some((address, prefix)) = subnet.split_once('/') else {
+                return Err(anyhow::anyhow!(
+                    "invalid exclude_subnets entry '{}': expected IPv4 CIDR",
+                    subnet
+                ));
+            };
+            let Ok(prefix_bits) = prefix.parse::<u8>() else {
+                return Err(anyhow::anyhow!(
+                    "invalid exclude_subnets entry '{}': expected IPv4 CIDR",
+                    subnet
+                ));
+            };
+            if address.parse::<std::net::Ipv4Addr>().is_err() || prefix_bits > 32 {
+                return Err(anyhow::anyhow!(
+                    "invalid exclude_subnets entry '{}': expected IPv4 CIDR",
+                    subnet
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -95,7 +133,19 @@ impl DFluxConfig {
         {
             return false;
         }
-        sys_class_net.join(iface).join("device").exists()
+        let iface_dir = sys_class_net.join(iface);
+        if iface_dir.join("device").exists() {
+            return true;
+        }
+        // In virtualized/container environments (LXC, Docker veth), physical network devices
+        // appear under /sys/devices/virtual/net without a hardware 'device' symlink,
+        // but have link type 1 (ARPHRD_ETHER).
+        if let Ok(type_str) = std::fs::read_to_string(iface_dir.join("type")) {
+            if type_str.trim() == "1" {
+                return true;
+            }
+        }
+        false
     }
 
     /// Attempts to auto-detect the default physical network interface by parsing `ip route show default`
@@ -158,6 +208,11 @@ mod tests {
         std::fs::create_dir_all(root.join("tun-test")).unwrap();
 
         assert!(config("enp-test").validate_with_sysfs(&root).is_ok());
+        let mut with_remote = config("enp-test");
+        with_remote.egress.remote_interface = Some("tun-test".into());
+        assert!(with_remote.validate_with_sysfs(&root).is_ok());
+        with_remote.egress.remote_interface = Some("missing-remote".into());
+        assert!(with_remote.validate_with_sysfs(&root).is_err());
         assert!(config("tun-test").validate_with_sysfs(&root).is_err());
         assert!(config("missing-test").validate_with_sysfs(&root).is_err());
         assert!(config("").validate_with_sysfs(&root).is_err());
