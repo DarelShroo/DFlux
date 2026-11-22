@@ -8,6 +8,7 @@ use tokio::net::{TcpSocket, TcpStream};
 use tokio::time::{Duration, Instant, timeout};
 
 use crate::egress::EgressManager;
+use crate::observability::{self, Level};
 
 pub const DFLUX_SO_MARK: u32 = 0x4446;
 pub const GLOBAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
@@ -157,6 +158,15 @@ where
     F: FnMut(usize) -> Pin<Box<dyn Future<Output = Result<T>> + Send>>,
 {
     let start_time = Instant::now();
+    let mut started =
+        observability::event(Level::Debug, "outbound_attempts", "outbound", "connect");
+    started
+        .fields
+        .insert("candidate_count".into(), serde_json::json!(candidate_count));
+    started
+        .fields
+        .insert("budget_ms".into(), serde_json::json!(budget.as_millis()));
+    observability::emit(started);
     let mut last_err = None;
     for idx in 0..candidate_count {
         let elapsed = start_time.elapsed();
@@ -171,6 +181,17 @@ where
         };
         match timeout(attempt_timeout, attempt(idx)).await {
             Ok(Ok(stream)) => {
+                let mut event =
+                    observability::event(Level::Info, "outbound_candidate", "outbound", "connect");
+                event.outcome = Some("success".into());
+                event
+                    .fields
+                    .insert("candidate_index".into(), serde_json::json!(idx));
+                event.fields.insert(
+                    "duration_ms".into(),
+                    serde_json::json!(start_time.elapsed().as_millis()),
+                );
+                observability::emit(event);
                 return Ok(stream);
             }
             Ok(Err(e)) => {
@@ -180,6 +201,19 @@ where
                     return Err(e);
                 }
                 tracing::warn!("Connection candidate {} failed: {}", idx, e);
+                let mut event =
+                    observability::event(Level::Warn, "outbound_candidate", "outbound", "connect");
+                event.outcome = Some("failure".into());
+                event.error_category = Some(format!("{:?}", classify_connect_failure(&e)));
+                event.error_message = Some(e.to_string());
+                event
+                    .fields
+                    .insert("candidate_index".into(), serde_json::json!(idx));
+                event.fields.insert(
+                    "duration_ms".into(),
+                    serde_json::json!(start_time.elapsed().as_millis()),
+                );
+                observability::emit(event);
                 last_err = Some(e);
             }
             Err(_) => {
@@ -188,6 +222,18 @@ where
                     idx,
                     attempt_timeout
                 );
+                let mut event =
+                    observability::event(Level::Warn, "outbound_candidate", "outbound", "connect");
+                event.outcome = Some("timeout".into());
+                event.error_category = Some("timeout".into());
+                event
+                    .fields
+                    .insert("candidate_index".into(), serde_json::json!(idx));
+                event.fields.insert(
+                    "duration_ms".into(),
+                    serde_json::json!(start_time.elapsed().as_millis()),
+                );
+                observability::emit(event);
                 last_err = Some(OutboundError::Timeout.into());
             }
         }

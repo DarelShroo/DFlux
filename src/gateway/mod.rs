@@ -1,12 +1,14 @@
 pub mod inspector;
 
 use crate::egress::EgressManager;
+use crate::observability::{self, Level};
 use crate::state::{Decision, StateManager};
 use anyhow::Result;
 use std::future::Future;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpStream;
 
 fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
@@ -238,11 +240,58 @@ where
     C: FnMut(Vec<IpAddr>, u16, bool) -> CF,
     CF: Future<Output = Result<T>>,
 {
+    let started = Instant::now();
+    let mut started_event = observability::event(
+        Level::Debug,
+        "gateway_connection_attempt",
+        "gateway",
+        "gateway_connect",
+    );
+    started_event
+        .fields
+        .insert("remote".into(), serde_json::json!(remote));
+    started_event
+        .fields
+        .insert("port".into(), serde_json::json!(port));
+    if let Some(host) = hostname {
+        started_event.fields.insert(
+            "hostname".into(),
+            serde_json::Value::String(observability::redact(host)),
+        );
+    }
+    observability::emit(started_event);
+
     let resolved = if let Some(host) = hostname {
         resolve(host.to_string(), remote).await
     } else {
         Ok(vec![original_ip])
     };
+    let mut dns_event = observability::event(
+        if resolved.is_ok() {
+            Level::Debug
+        } else {
+            Level::Warn
+        },
+        "gateway_dns_result",
+        "gateway",
+        "gateway_connect",
+    );
+    dns_event
+        .fields
+        .insert("remote".into(), serde_json::json!(remote));
+    dns_event.fields.insert(
+        "addresses".into(),
+        serde_json::json!(resolved.as_ref().map(Vec::len).unwrap_or_default()),
+    );
+    dns_event.fields.insert(
+        "duration_ms".into(),
+        serde_json::json!(started.elapsed().as_millis()),
+    );
+    if let Err(error) = &resolved {
+        dns_event.error_category = Some("dns".into());
+        dns_event.error_message = Some(error.to_string());
+    }
+    observability::emit(dns_event);
     let ips = match resolved {
         Ok(ips) if !ips.is_empty() => ips,
         Ok(_) | Err(_) if !remote && remote_available => {
@@ -252,21 +301,76 @@ where
             if ips.is_empty() {
                 return Err(anyhow::anyhow!("REMOTE DNS returned no addresses"));
             }
-            return connect(ips, port, true).await.map(|stream| (stream, true));
+            let result = connect(ips, port, true).await;
+            let mut event = observability::event(
+                if result.is_ok() {
+                    Level::Info
+                } else {
+                    Level::Error
+                },
+                "gateway_fallback_result",
+                "gateway",
+                "gateway_connect",
+            );
+            event.outcome = Some(if result.is_ok() { "success" } else { "failure" }.into());
+            event
+                .fields
+                .insert("remote".into(), serde_json::json!(true));
+            event.fields.insert(
+                "duration_ms".into(),
+                serde_json::json!(started.elapsed().as_millis()),
+            );
+            if let Err(error) = &result {
+                event.error_category = Some("fallback_connect".into());
+                event.error_message = Some(error.to_string());
+            }
+            observability::emit(event);
+            return result.map(|stream| (stream, true));
         }
         Ok(ips) if !remote && hostname.is_none() => ips,
         Ok(_) => return Err(anyhow::anyhow!("DNS returned no addresses")),
         Err(error) => return Err(error),
     };
 
-    match connect(ips.clone(), port, remote).await {
-        Ok(stream) => Ok((stream, remote)),
+    let direct_result = connect(ips.clone(), port, remote).await;
+    match direct_result {
+        Ok(stream) => {
+            let mut event = observability::event(
+                Level::Info,
+                "gateway_connect_result",
+                "gateway",
+                "gateway_connect",
+            );
+            event.outcome = Some("success".into());
+            event
+                .fields
+                .insert("remote".into(), serde_json::json!(remote));
+            event.fields.insert(
+                "duration_ms".into(),
+                serde_json::json!(started.elapsed().as_millis()),
+            );
+            observability::emit(event);
+            Ok((stream, remote))
+        }
         Err(error)
             if !remote
                 && remote_available
                 && crate::outbound::classify_connect_failure(&error)
                     == crate::outbound::ConnectFailureClass::RecoverableNetwork =>
         {
+            let mut fallback_event = observability::event(
+                Level::Warn,
+                "gateway_fallback_attempt",
+                "gateway",
+                "gateway_connect",
+            );
+            fallback_event.outcome = Some("attempted".into());
+            fallback_event.error_category = Some("recoverable_network".into());
+            fallback_event.error_message = Some(error.to_string());
+            fallback_event
+                .fields
+                .insert("remote".into(), serde_json::json!(true));
+            observability::emit(fallback_event);
             let remote_ips = if let Some(host) = hostname {
                 resolve(host.to_string(), true).await?
             } else {
@@ -275,11 +379,73 @@ where
             if remote_ips.is_empty() {
                 return Err(anyhow::anyhow!("REMOTE DNS returned no addresses"));
             }
-            connect(remote_ips, port, true)
-                .await
-                .map(|stream| (stream, true))
+            let result = connect(remote_ips, port, true).await;
+            let mut event = observability::event(
+                if result.is_ok() {
+                    Level::Info
+                } else {
+                    Level::Error
+                },
+                "gateway_fallback_result",
+                "gateway",
+                "gateway_connect",
+            );
+            event.outcome = Some(if result.is_ok() { "success" } else { "failure" }.into());
+            event
+                .fields
+                .insert("remote".into(), serde_json::json!(true));
+            event.fields.insert(
+                "duration_ms".into(),
+                serde_json::json!(started.elapsed().as_millis()),
+            );
+            if let Err(error) = &result {
+                event.error_category = Some("fallback_connect".into());
+                event.error_message = Some(error.to_string());
+            }
+            observability::emit(event);
+            result.map(|stream| (stream, true))
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            let mut event = observability::event(
+                Level::Error,
+                "gateway_connect_result",
+                "gateway",
+                "gateway_connect",
+            );
+            event.outcome = Some("failure".into());
+            event.error_category = Some("connect".into());
+            event.error_message = Some(error.to_string());
+            event
+                .fields
+                .insert("remote".into(), serde_json::json!(remote));
+            event.fields.insert(
+                "duration_ms".into(),
+                serde_json::json!(started.elapsed().as_millis()),
+            );
+            observability::emit(event);
+            let mut incident = observability::event(
+                Level::Critical,
+                "incident_connectivity_failure",
+                "gateway",
+                "gateway_connect",
+            );
+            incident.outcome = Some("detected".into());
+            incident.error_category = Some("connectivity".into());
+            incident.error_message = Some(error.to_string());
+            incident
+                .fields
+                .insert("root_cause".into(), serde_json::json!("UNDETERMINED"));
+            incident.fields.insert(
+                "evidence".into(),
+                serde_json::json!(["gateway_connect_result=failure", "no_verified_recovery"]),
+            );
+            incident.fields.insert(
+                "duration_ms".into(),
+                serde_json::json!(started.elapsed().as_millis()),
+            );
+            observability::emit(incident);
+            Err(error)
+        }
     }
 }
 

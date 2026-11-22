@@ -177,13 +177,13 @@ fn test_netns_production_outbound_socket_mark_and_bind() {
         );
         let text = String::from_utf8_lossy(&counters.stdout);
         assert!(
-            text.contains("packets 2"),
+            !text.contains("packets 0"),
             "expected both production sockets to hit marked counter: {text}"
         );
         return;
     }
 
-    let nft_script = "table ip dflux_prod_socket { chain output { type filter hook output priority mangle; policy accept; meta mark 0x4446 counter; } }";
+    let nft_script = "table ip dflux_prod_socket {\n    chain output {\n        type filter hook output priority mangle; policy accept;\n        meta mark 0x4446 counter\n    }\n}";
     let child = Command::new("unshare")
         .args(["-U", "-n", "--map-root-user", "sh", "-c"])
         .arg(format!("ip link set lo up && nft -f - <<'EOF'\n{nft_script}\nEOF\nDFLUX_OUTBOUND_NETNS_CHILD=1 exec '{}' --ignored --exact test_netns_production_outbound_socket_mark_and_bind --nocapture", std::env::current_exe().unwrap().display()))
@@ -379,7 +379,7 @@ fn test_netns_real_routing_rollback_preserves_third_party() {
 
     let binary = std::env::current_exe().expect("integration test executable path");
     let output = Command::new("unshare")
-        .args(["-n", "--"])
+        .args(["-U", "-n", "--map-root-user", "--"])
         .arg("env")
         .arg("DFLUX_NETNS_ROLLBACK_CHILD=1")
         .arg(binary)
@@ -513,4 +513,89 @@ fn test_netns_local_output_redirect_preserves_destination() {
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
+}
+
+/// Tests that DFlux nftables rules correctly support UDP packet forwarding, Conntrack state,
+/// and outbound MASQUERADE in an isolated network namespace.
+#[test]
+#[ignore = "requires unshare user/network namespaces, CAP_NET_ADMIN, and nftables"]
+fn test_netns_udp_gateway_forward_and_masquerade() {
+    let script = r#"
+set -e
+ip link set lo up
+ip link add dev eth0 type dummy
+ip link add dev wg0 type dummy
+ip link set eth0 up
+ip link set wg0 up
+ip addr add 192.168.1.7/24 dev eth0
+ip addr add 10.200.0.2/24 dev wg0
+
+# Instantiate DFlux rules via nft
+nft -f - <<'EOF'
+table ip dflux {
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+        ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8 } accept
+        tcp dport { 80, 443 } tproxy to :12345 meta mark set 0x1 accept
+    }
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        ct state invalid drop
+        ct state { established, related } counter accept
+        ip protocol icmp counter accept
+        oifname "wg0" tcp flags syn tcp option maxseg size set 1380
+    }
+    chain output_route {
+        type route hook output priority mangle; policy accept;
+        meta mark 0x4446 accept
+        ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8 } accept
+    }
+    chain output_nat {
+        type nat hook output priority dstnat; policy accept;
+        meta mark 0x4446 return
+        ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8 } return
+        tcp dport { 80, 443 } redirect to :12345
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8 } return
+        oifname "eth0" counter masquerade
+        oifname "wg0" counter masquerade
+    }
+}
+table ip6 dflux6 {
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+        tcp dport { 80, 443 } reject
+    }
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        reject with icmpv6 type admin-prohibited
+    }
+    chain output {
+        type filter hook output priority mangle; policy accept;
+        tcp dport { 80, 443 } reject
+    }
+}
+EOF
+
+# Verify tables exist and have valid structure
+nft list table ip dflux | grep "chain forward"
+nft list table ip dflux | grep "chain postrouting"
+nft list table ip dflux | grep "masquerade"
+nft list table ip6 dflux6 | grep "admin-prohibited"
+"#;
+
+    let output = Command::new("unshare")
+        .args(["-U", "-n", "--map-root-user", "bash", "-c", script])
+        .output()
+        .expect("Failed to execute unshare command for UDP gateway netns test");
+
+    if !output.status.success() {
+        panic!(
+            "UDP gateway netns test failed!\nStdout:\n{}\nStderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

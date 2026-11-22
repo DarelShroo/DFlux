@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod egress;
 pub mod gateway;
+pub mod observability;
 pub mod outbound;
 pub mod probes;
 pub mod proxy;

@@ -15,6 +15,7 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
 use crate::egress::EgressManager;
+use crate::observability::{self, Level};
 
 pub const GLOBAL_DOH_TIMEOUT: Duration = Duration::from_millis(2500);
 pub const MAX_HTTP_HEADERS_SIZE: usize = 8192;
@@ -188,6 +189,7 @@ pub async fn resolve(
     }
     let hostname = hostname.to_string();
     let lookup_key = hostname.clone();
+    let started = Instant::now();
     let transport_mgr = egress_mgr.clone();
     let result = resolve_cached(
         &DNS_CACHE,
@@ -250,9 +252,40 @@ pub async fn resolve(
     .await;
     match &result {
         Ok(ips) => {
+            let mut event = observability::event(Level::Info, "dns_resolution", "dns", "resolve");
+            event.outcome = Some("success".into());
+            event
+                .fields
+                .insert("hostname".into(), serde_json::json!(lookup_key));
+            event
+                .fields
+                .insert("remote".into(), serde_json::json!(enforce_remote));
+            event
+                .fields
+                .insert("addresses".into(), serde_json::json!(ips.len()));
+            event.fields.insert(
+                "duration_ms".into(),
+                serde_json::json!(started.elapsed().as_millis()),
+            );
+            observability::emit(event);
             tracing::debug!(hostname = %lookup_key, route = if enforce_remote { "REMOTE" } else { "DIRECT" }, addresses = ?ips, "DoH resolution completed")
         }
         Err(error) => {
+            let mut event = observability::event(Level::Warn, "dns_resolution", "dns", "resolve");
+            event.outcome = Some("failure".into());
+            event.error_category = Some("dns".into());
+            event.error_message = Some(error.to_string());
+            event
+                .fields
+                .insert("hostname".into(), serde_json::json!(lookup_key));
+            event
+                .fields
+                .insert("remote".into(), serde_json::json!(enforce_remote));
+            event.fields.insert(
+                "duration_ms".into(),
+                serde_json::json!(started.elapsed().as_millis()),
+            );
+            observability::emit(event);
             tracing::warn!(hostname = %lookup_key, route = if enforce_remote { "REMOTE" } else { "DIRECT" }, error = %error, "DoH resolution failed")
         }
     }
@@ -275,8 +308,26 @@ where
     let flight = cache.flight(hostname, remote).await;
     let _flight_guard = flight.lock().await;
     if let Some(cached_ips) = cache.get(hostname, remote).await {
+        let mut event = observability::event(Level::Debug, "dns_cache", "dns", "resolve");
+        event.outcome = Some("hit".into());
+        event
+            .fields
+            .insert("hostname".into(), serde_json::json!(hostname));
+        event
+            .fields
+            .insert("remote".into(), serde_json::json!(remote));
+        observability::emit(event);
         return Ok(cached_ips);
     }
+    let mut event = observability::event(Level::Debug, "dns_cache", "dns", "resolve");
+    event.outcome = Some("miss".into());
+    event
+        .fields
+        .insert("hostname".into(), serde_json::json!(hostname));
+    event
+        .fields
+        .insert("remote".into(), serde_json::json!(remote));
+    observability::emit(event);
     let result = transport().await;
     if let Ok(resolved) = &result {
         if resolved.is_empty() {

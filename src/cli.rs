@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "dflux", about = "Adaptive Egress Gateway", version = "0.1.0")]
@@ -55,4 +56,10 @@ pub enum Commands {
     },
     /// Manually remove DFlux routing rules if the daemon crashed
     Rollback,
+    /// Show buffered diagnostic events and optionally export them as JSON
+    Diagnose {
+        /// Write the bounded diagnostic snapshot to this path
+        #[arg(long)]
+        export: Option<PathBuf>,
+    },
 }

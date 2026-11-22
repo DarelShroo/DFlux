@@ -592,6 +592,9 @@ fn test_state_file_roundtrip_partial_state_and_absent_cleanup() {
         nft_active: false,
         ip_rule_active: false,
         ip_route_active: false,
+        ip_forward_original: None,
+        send_redirects_original: None,
+        conntrack_udp_timeout_stream_original: None,
     };
 
     RoutingEngine::save_state_to_path(&state_file, &state).expect("Atomic state write failed");
@@ -629,4 +632,99 @@ fn test_state_file_roundtrip_partial_state_and_absent_cleanup() {
     );
 
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_gateway_nft_rules_contain_forward_conntrack_and_masquerade() {
+    // 1. Direct only configuration
+    let engine_direct = RoutingEngine::new(
+        12345,
+        "eth0".to_string(),
+        None,
+        "10.0.0.0/8, 192.168.0.0/16".to_string(),
+    );
+    let rules_direct = engine_direct.generate_nft_rules();
+
+    // Verify Prerouting TPROXY
+    assert!(rules_direct.contains("chain prerouting"));
+    assert!(
+        rules_direct.contains("tcp dport { 80, 443 } tproxy to :12345 meta mark set 0x1 accept")
+    );
+    assert!(rules_direct.contains("ip daddr { 10.0.0.0/8, 192.168.0.0/16 } accept"));
+
+    // Verify Forward chain: Conntrack state tracking and ICMP preservation
+    assert!(rules_direct.contains("chain forward"));
+    assert!(rules_direct.contains("ct state invalid drop"));
+    assert!(rules_direct.contains("ct state { established, related } accept"));
+    assert!(rules_direct.contains("ip protocol icmp accept"));
+
+    // Verify Postrouting NAT & Masquerade
+    assert!(rules_direct.contains("chain postrouting"));
+    assert!(rules_direct.contains("ip daddr { 10.0.0.0/8, 192.168.0.0/16 } return"));
+    assert!(rules_direct.contains("oifname \"eth0\" masquerade"));
+    assert!(!rules_direct.contains("oifname \"wg0\" masquerade"));
+
+    // Verify absence of application-specific hardcodes (generic gateway compliance)
+    assert!(
+        !rules_direct.to_lowercase().contains("whatsapp"),
+        "DFlux must not contain application-specific hardcodes"
+    );
+
+    // 2. Dual-interface configuration with VPN tunnel (remote_iface)
+    let engine_dual = RoutingEngine::new(
+        12345,
+        "eth0".to_string(),
+        Some("wg0".to_string()),
+        "10.0.0.0/8, 192.168.0.0/16".to_string(),
+    );
+    let rules_dual = engine_dual.generate_nft_rules();
+
+    // Verify Masquerade on both interfaces
+    assert!(rules_dual.contains("oifname \"eth0\" masquerade"));
+    assert!(rules_dual.contains("oifname \"wg0\" masquerade"));
+
+    // Verify MSS Clamping on VPN interface to prevent MTU blackholes
+    assert!(rules_dual.contains("oifname \"wg0\" tcp flags syn tcp option maxseg size set 1380"));
+
+    // 3. Loopback interface should never be masqueraded
+    let engine_lo = RoutingEngine::new(12345, "lo".to_string(), None, "127.0.0.0/8".to_string());
+    let rules_lo = engine_lo.generate_nft_rules();
+    assert!(!rules_lo.contains("oifname \"lo\" masquerade"));
+}
+
+#[test]
+fn test_gateway_nft6_rules_contain_forward_reject() {
+    let engine = RoutingEngine::new(12345, "eth0".to_string(), None, "10.0.0.0/8".to_string());
+    let rules6 = engine.generate_nft6_rules();
+
+    assert!(rules6.contains("table ip6 dflux6"));
+    assert!(rules6.contains("chain prerouting"));
+    assert!(rules6.contains("chain forward"));
+    assert!(rules6.contains("reject with icmpv6 type admin-prohibited"));
+    assert!(rules6.contains("chain output"));
+}
+
+#[test]
+fn test_legacy_deployment_state_backward_compatibility() {
+    // Legacy state.json without the new sysctl restore fields
+    let legacy_json = r#"{
+        "uuid": "legacy-uuid-5678",
+        "pid": 1234,
+        "created_at": 1700000000,
+        "table_name": "dflux",
+        "rule_pref": 32000,
+        "fwmark": 1,
+        "table_id": 100,
+        "nft_active": true,
+        "ip_rule_active": true,
+        "ip_route_active": true
+    }"#;
+
+    let state: DeploymentState = serde_json::from_str(legacy_json)
+        .expect("Legacy state format must deserialize cleanly via serde defaults");
+
+    assert_eq!(state.uuid, "legacy-uuid-5678");
+    assert_eq!(state.ip_forward_original, None);
+    assert_eq!(state.send_redirects_original, None);
+    assert_eq!(state.conntrack_udp_timeout_stream_original, None);
 }

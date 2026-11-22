@@ -4,7 +4,7 @@ use dflux::config::DFluxConfig;
 use dflux::egress::{self, EgressManager};
 use dflux::routing::RoutingEngine;
 use dflux::state::StateManager;
-use dflux::{gateway, probes, proxy};
+use dflux::{gateway, observability, probes, proxy};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -14,6 +14,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize logging
     tracing_subscriber::fmt::init();
+    observability::Observer::install_global(observability::Observer::new(
+        observability::ObserverConfig::default(),
+    ));
 
     let cli = Cli::parse();
 
@@ -149,6 +152,18 @@ async fn main() -> anyhow::Result<()> {
             // We just instantiate a dummy engine and call stop()
             let routing_engine = RoutingEngine::new(12345, "".to_string(), None, "".to_string());
             routing_engine.stop()?;
+        }
+        Commands::Diagnose { export } => {
+            let observer = observability::Observer::global()
+                .expect("observability is initialized before command dispatch");
+            if let Some(path) = export {
+                observer.export_json(path)?;
+                println!("Diagnostic snapshot exported to {}", path.display());
+            } else {
+                println!("Buffered events: {}", observer.snapshot().len());
+                println!("Dropped events: {}", observer.dropped_events());
+                println!("{}", serde_json::to_string_pretty(&observer.snapshot())?);
+            }
         }
     }
 

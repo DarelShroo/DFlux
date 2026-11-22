@@ -23,6 +23,12 @@ pub struct DeploymentState {
     pub nft_active: bool,
     pub ip_rule_active: bool,
     pub ip_route_active: bool,
+    #[serde(default)]
+    pub ip_forward_original: Option<String>,
+    #[serde(default)]
+    pub send_redirects_original: Option<String>,
+    #[serde(default)]
+    pub conntrack_udp_timeout_stream_original: Option<String>,
 }
 
 /// Manages routing rules using nftables and policy routing with strict concurrency control,
@@ -100,8 +106,7 @@ impl RoutingEngine {
         // 2. Pre-inspection: Check for conflicting pre-existing resources
         self.check_preexisting_conflicts()?;
 
-        // 3. Initialize deployment state tracking. TPROXY terminates connections locally, so
-        // forwarding and broad postrouting NAT are not needed and are deliberately untouched.
+        // 3. Initialize deployment state tracking.
         let uuid = format!(
             "{:016x}",
             std::time::SystemTime::now()
@@ -121,13 +126,87 @@ impl RoutingEngine {
             nft_active: false,
             ip_rule_active: false,
             ip_route_active: false,
+            ip_forward_original: None,
+            send_redirects_original: None,
+            conntrack_udp_timeout_stream_original: None,
         };
 
-        // 5. Step 1: Apply nftables table
-        let rules = format!(
-            "table ip dflux {{\n    chain prerouting {{\n        type filter hook prerouting priority mangle; policy accept;\n        ip daddr {{ {exclude_subnets} }} accept\n        tcp dport {{ 80, 443 }} tproxy to :{port} meta mark set 1 accept\n    }}\n    chain output_route {{\n        type route hook output priority mangle; policy accept;\n        meta mark 0x4446 accept\n        ip daddr {{ {exclude_subnets} }} accept\n    }}\n    chain output_nat {{\n        type nat hook output priority dstnat; policy accept;\n        meta mark 0x4446 return\n        ip daddr {{ {exclude_subnets} }} return\n        tcp dport {{ 80, 443 }} redirect to :{port}\n    }}\n}}\ntable ip6 dflux6 {{\n    chain prerouting {{ type filter hook prerouting priority mangle; policy accept; tcp dport {{ 80, 443 }} reject; }}\n    chain output {{ type filter hook output priority mangle; policy accept; tcp dport {{ 80, 443 }} reject; }}\n}}",
-            port = self.port,
-            exclude_subnets = self.exclude_subnets,
+        // 4. Configure kernel sysctls for transparent gateway forwarding
+        // Enable IPv4 forwarding so non-proxied (UDP, non-80/443 TCP, ICMP) traffic is routed
+        let orig_fwd = Self::read_sysctl("/proc/sys/net/ipv4/ip_forward", "net.ipv4.ip_forward");
+        if let Err(e) =
+            Self::write_sysctl("/proc/sys/net/ipv4/ip_forward", "net.ipv4.ip_forward", "1")
+        {
+            eprintln!("Warning: failed to enable net.ipv4.ip_forward: {e}");
+        }
+        state.ip_forward_original = orig_fwd;
+
+        // Disable ICMP redirects to prevent asymmetric routing confusion and client socket resets
+        let orig_redir = Self::read_sysctl(
+            "/proc/sys/net/ipv4/conf/all/send_redirects",
+            "net.ipv4.conf.all.send_redirects",
+        );
+        let _ = Self::write_sysctl(
+            "/proc/sys/net/ipv4/conf/all/send_redirects",
+            "net.ipv4.conf.all.send_redirects",
+            "0",
+        );
+        let direct_redir_path = format!(
+            "/proc/sys/net/ipv4/conf/{}/send_redirects",
+            self.direct_iface
+        );
+        let direct_redir_name = format!("net.ipv4.conf.{}.send_redirects", self.direct_iface);
+        let _ = Self::write_sysctl(&direct_redir_path, &direct_redir_name, "0");
+        if let Some(ref rem) = self.remote_iface {
+            let rem_redir_path = format!("/proc/sys/net/ipv4/conf/{}/send_redirects", rem);
+            let rem_redir_name = format!("net.ipv4.conf.{}.send_redirects", rem);
+            let _ = Self::write_sysctl(&rem_redir_path, &rem_redir_name, "0");
+        }
+        state.send_redirects_original = orig_redir;
+
+        // Ensure loose reverse-path filtering (rp_filter <= 2) so return packets are not dropped
+        if Self::read_sysctl(
+            "/proc/sys/net/ipv4/conf/all/rp_filter",
+            "net.ipv4.conf.all.rp_filter",
+        )
+        .as_deref()
+            == Some("1")
+        {
+            let _ = Self::write_sysctl(
+                "/proc/sys/net/ipv4/conf/all/rp_filter",
+                "net.ipv4.conf.all.rp_filter",
+                "2",
+            );
+        }
+        let direct_rp_path = format!("/proc/sys/net/ipv4/conf/{}/rp_filter", self.direct_iface);
+        let direct_rp_name = format!("net.ipv4.conf.{}.rp_filter", self.direct_iface);
+        if Self::read_sysctl(&direct_rp_path, &direct_rp_name).as_deref() == Some("1") {
+            let _ = Self::write_sysctl(&direct_rp_path, &direct_rp_name, "2");
+        }
+
+        // Optimize conntrack UDP stream timeout for reliable voice/video calls (minimum 180s)
+        let orig_ct_udp = Self::read_sysctl(
+            "/proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream",
+            "net.netfilter.nf_conntrack_udp_timeout_stream",
+        );
+        if let Some(ref ct_val) = orig_ct_udp {
+            if let Ok(secs) = ct_val.parse::<u32>() {
+                if secs < 180 {
+                    let _ = Self::write_sysctl(
+                        "/proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream",
+                        "net.netfilter.nf_conntrack_udp_timeout_stream",
+                        "180",
+                    );
+                    state.conntrack_udp_timeout_stream_original = orig_ct_udp;
+                }
+            }
+        }
+
+        // 5. Step 1: Apply nftables tables (IPv4 and IPv6)
+        let full_rules = format!(
+            "{}\n{}",
+            self.generate_nft_rules(),
+            self.generate_nft6_rules()
         );
 
         let mut child = Command::new("nft")
@@ -138,7 +217,7 @@ impl RoutingEngine {
             .spawn()?;
 
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(rules.as_bytes())?;
+            stdin.write_all(full_rules.as_bytes())?;
         }
 
         let output = child.wait_with_output()?;
@@ -193,9 +272,125 @@ impl RoutingEngine {
         Ok(())
     }
 
+    /// Generates structured nftables rules for IPv4 transparent gateway, forwarding, and NAT.
+    pub fn generate_nft_rules(&self) -> String {
+        let mut forward_mss = String::new();
+        let mut postrouting_rem = String::new();
+        if let Some(ref rem) = self.remote_iface {
+            let rem_trimmed = rem.trim();
+            if !rem_trimmed.is_empty() && rem_trimmed != "lo" {
+                forward_mss = format!(
+                    "        oifname \"{rem_trimmed}\" tcp flags syn tcp option maxseg size set 1380\n"
+                );
+                postrouting_rem = format!("        oifname \"{rem_trimmed}\" masquerade\n");
+            }
+        }
+        let postrouting_dir = if self.direct_iface != "lo" && !self.direct_iface.trim().is_empty() {
+            format!(
+                "        oifname \"{}\" masquerade\n",
+                self.direct_iface.trim()
+            )
+        } else {
+            String::new()
+        };
+
+        format!(
+            r#"table ip dflux {{
+    chain prerouting {{
+        type filter hook prerouting priority mangle; policy accept;
+        ip daddr {{ {exclude_subnets} }} accept
+        tcp dport {{ 80, 443 }} tproxy to :{port} meta mark set 0x1 accept
+    }}
+    chain forward {{
+        type filter hook forward priority filter; policy accept;
+        ct state invalid drop
+        ct state {{ established, related }} accept
+        ip protocol icmp accept
+{forward_mss}    }}
+    chain output_route {{
+        type route hook output priority mangle; policy accept;
+        meta mark 0x4446 accept
+        ip daddr {{ {exclude_subnets} }} accept
+    }}
+    chain output_nat {{
+        type nat hook output priority dstnat; policy accept;
+        meta mark 0x4446 return
+        ip daddr {{ {exclude_subnets} }} return
+        tcp dport {{ 80, 443 }} redirect to :{port}
+    }}
+    chain postrouting {{
+        type nat hook postrouting priority srcnat; policy accept;
+        ip daddr {{ {exclude_subnets} }} return
+{postrouting_dir}{postrouting_rem}    }}
+}}"#,
+            exclude_subnets = self.exclude_subnets,
+            port = self.port,
+            forward_mss = forward_mss,
+            postrouting_dir = postrouting_dir,
+            postrouting_rem = postrouting_rem,
+        )
+    }
+
+    /// Generates structured nftables rules for IPv6.
+    pub fn generate_nft6_rules(&self) -> String {
+        r#"table ip6 dflux6 {
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+        tcp dport { 80, 443 } reject
+    }
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        reject with icmpv6 type admin-prohibited
+    }
+    chain output {
+        type filter hook output priority mangle; policy accept;
+        tcp dport { 80, 443 } reject
+    }
+}"#
+        .to_string()
+    }
+
+    /// Reads a kernel sysctl from procfs with fallback to the sysctl binary.
+    pub fn read_sysctl(proc_path: &str, sysctl_name: &str) -> Option<String> {
+        if let Ok(content) = fs::read_to_string(proc_path) {
+            return Some(content.trim().to_string());
+        }
+        if let Ok(output) = Command::new("sysctl").args(["-n", sysctl_name]).output() {
+            if output.status.success() {
+                return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
+            }
+        }
+        None
+    }
+
+    /// Writes a kernel sysctl to procfs with fallback to the sysctl binary.
+    pub fn write_sysctl(proc_path: &str, sysctl_name: &str, value: &str) -> Result<()> {
+        if let Ok(mut f) = OpenOptions::new().write(true).open(proc_path) {
+            if f.write_all(value.as_bytes()).is_ok() {
+                return Ok(());
+            }
+        }
+        let res = Command::new("sysctl")
+            .args(["-w", &format!("{sysctl_name}={value}")])
+            .output();
+        match res {
+            Ok(out) if out.status.success() => Ok(()),
+            Ok(out) => Err(anyhow!(
+                "sysctl -w {} failed: {}",
+                sysctl_name,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(e) => Err(anyhow!(
+                "Failed to execute sysctl for {}: {}",
+                sysctl_name,
+                e
+            )),
+        }
+    }
+
     /// Conservatively rolls back network resources created by DFlux.
     /// Order: (1) Verify ownership, (2) Flush/delete nftables table, (3) Delete ip rule,
-    /// (4) Delete local route, (5) Update state and remove state file when complete.
+    /// (4) Delete local route, (5) Restore sysctls, (6) Update state and remove state file when complete.
     pub fn stop(&self) -> Result<()> {
         println!("Stopping Routing Engine and reverting changes...");
         let state_file = self.run_dir.join("state.json");
@@ -274,7 +469,41 @@ impl RoutingEngine {
             }
         }
 
-        // Step 4: If all resources are verified cleaned, remove state.json
+        // Step 4: Restore sysctls if previously recorded
+        if let Some(ref st) = loaded_state {
+            if let Some(ref orig_fwd) = st.ip_forward_original {
+                if orig_fwd != "1" {
+                    let _ = Self::write_sysctl(
+                        "/proc/sys/net/ipv4/ip_forward",
+                        "net.ipv4.ip_forward",
+                        orig_fwd,
+                    );
+                }
+            }
+            if let Some(ref orig_redir) = st.send_redirects_original {
+                let _ = Self::write_sysctl(
+                    "/proc/sys/net/ipv4/conf/all/send_redirects",
+                    "net.ipv4.conf.all.send_redirects",
+                    orig_redir,
+                );
+                let direct_redir_path = format!(
+                    "/proc/sys/net/ipv4/conf/{}/send_redirects",
+                    self.direct_iface
+                );
+                let direct_redir_name =
+                    format!("net.ipv4.conf.{}.send_redirects", self.direct_iface);
+                let _ = Self::write_sysctl(&direct_redir_path, &direct_redir_name, orig_redir);
+            }
+            if let Some(ref orig_ct) = st.conntrack_udp_timeout_stream_original {
+                let _ = Self::write_sysctl(
+                    "/proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream",
+                    "net.netfilter.nf_conntrack_udp_timeout_stream",
+                    orig_ct,
+                );
+            }
+        }
+
+        // Step 5: If all resources are verified cleaned, remove state.json
         if let Some(ref st) = loaded_state
             && !st.nft_active
             && !st.ip_rule_active

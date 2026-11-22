@@ -57,6 +57,19 @@ If the daemon crashed and left routing rules behind:
 sudo target/release/dflux rollback
 ```
 
+#### Observabilidad y diagnóstico
+
+El registro forense es acotado en memoria y puede persistirse como JSON Lines sin payloads
+ni credenciales. Configura `DFLUX_LOG_DIR` para activarlo y consulta el último contexto con:
+
+```bash
+DFLUX_LOG_DIR=/var/log/dflux target/release/dflux diagnose
+DFLUX_LOG_DIR=/var/log/dflux target/release/dflux diagnose --export /tmp/dflux-diagnostic.json
+```
+
+`DFLUX_LOG_MAX_FILE_BYTES`, `DFLUX_LOG_MAX_TOTAL_BYTES` y `DFLUX_LOG_BUFFER_CAPACITY`
+limitan respectivamente la rotación, el almacenamiento total y la caja negra en memoria.
+
 #### Test and Compare Domains (Diagnostic Mode)
 ```bash
 target/release/dflux compare dd20bb891979d25aebc8bec07b2b3bbc.r2.cloudflarestorage.com --direct-iface wlp14s0 --remote-iface tun0
