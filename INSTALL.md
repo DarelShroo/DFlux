@@ -90,32 +90,48 @@ sudo cp target/release/dflux /usr/local/bin/dflux
 sudo setcap cap_net_raw,cap_net_admin+ep /usr/local/bin/dflux
 ```
 
-### 6. Create a Systemd Service
-To ensure DFlux runs automatically on boot in the background, create a `systemd` service file.
+### 6. Configure Kernel IP Forwarding & Systemd Service
 
-1. Open a new service file:
+#### A. Persistent Kernel Forwarding
+If this machine or LXC container functions as a default gateway for LAN clients, configure permanent IP forwarding in sysctl so the host continues forwarding packets even if the proxy daemon restarts or stops:
+
 ```bash
-sudo nano /etc/systemd/system/dflux.service
+sudo bash -c 'cat <<EOF > /etc/sysctl.d/99-dflux-gateway.conf
+net.ipv4.ip_forward = 1
+EOF'
+sudo sysctl --system
 ```
-2. Paste the following configuration. 
-> **Note on Network Interfaces:** DFlux attempts to auto-detect your default internet interface. However, it is highly recommended to specify it explicitly. You can find your active network interfaces by running `ip -br link` or `ip route show default`. Replace `wlp14s0` in the configuration below with your actual LAN interface (e.g., `eth0`, `enp3s0`).
+
+#### B. Create Systemd Service
+To ensure DFlux runs automatically on boot with high descriptor limits, watchdog supervision, and automatic recovery on error, create a `systemd` service file:
+
+```bash
+sudo cp systemd/dflux.service /etc/systemd/system/dflux.service
+```
+Or edit `/etc/systemd/system/dflux.service`:
 
 ```ini
 [Unit]
 Description=DFlux Transparent Egress Gateway
-After=network-online.target
+Documentation=https://github.com/dflux/dflux
+After=network-online.target network.target systemd-networkd.service
 Wants=network-online.target
 
 [Service]
-Type=simple
-EnvironmentFile=/etc/dflux/dflux.env
-# You can still pass CLI arguments (e.g. --direct-iface), but they are not required if defined in the env file.
+Type=notify
+NotifyAccess=main
+EnvironmentFile=-/etc/dflux/dflux.env
 ExecStart=/usr/local/bin/dflux mode enforce
 Restart=on-failure
-RestartSec=5
-# Clean up network state before starting and after stopping
-ExecStop=/usr/local/bin/dflux rollback
+RestartSec=3s
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+WatchdogSec=15s
+LimitNOFILE=65536
+LimitNOFILESoft=65536
 AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+ExecStop=/usr/local/bin/dflux rollback
+TimeoutStopSec=10s
 
 [Install]
 WantedBy=multi-user.target
@@ -230,32 +246,48 @@ sudo cp target/release/dflux /usr/local/bin/dflux
 sudo setcap cap_net_raw,cap_net_admin+ep /usr/local/bin/dflux
 ```
 
-### 6. Crear el Servicio Systemd
-Para que DFlux se ejecute automáticamente al arrancar el ordenador en segundo plano, crearemos un servicio `systemd`.
+### 6. Configurar Forwarding Permanente en el Kernel y Servicio Systemd
 
-1. Abre un nuevo archivo de servicio:
+#### A. Reenvío IP Permanente en el Host/LXC
+Si esta máquina o contenedor LXC actúa como gateway para clientes de la LAN, configura el reenvío permanente en sysctl para que el kernel mantenga la conectividad si el demonio se reinicia o detiene:
+
 ```bash
-sudo nano /etc/systemd/system/dflux.service
+sudo bash -c 'cat <<EOF > /etc/sysctl.d/99-dflux-gateway.conf
+net.ipv4.ip_forward = 1
+EOF'
+sudo sysctl --system
 ```
-2. Pega la siguiente configuración.
-> **Nota sobre Interfaces de Red:** DFlux intentará auto-detectar tu interfaz de internet predeterminada. Sin embargo, es muy recomendable especificarla explícitamente. Puedes averiguar cuáles son tus interfaces de red activas ejecutando `ip -br link` o `ip route show default`. Reemplaza `wlp14s0` en la configuración de abajo por tu interfaz LAN real (ej. `eth0`, `enp3s0`).
+
+#### B. Instalar el Servicio Systemd
+Para que DFlux se ejecute permanentemente con límites altos de descriptores (65536), supervisión por watchdog de systemd y reinicio automático en caso de fallo:
+
+```bash
+sudo cp systemd/dflux.service /etc/systemd/system/dflux.service
+```
+O edita `/etc/systemd/system/dflux.service`:
 
 ```ini
 [Unit]
 Description=DFlux Transparent Egress Gateway
-After=network-online.target
+Documentation=https://github.com/dflux/dflux
+After=network-online.target network.target systemd-networkd.service
 Wants=network-online.target
 
 [Service]
-Type=simple
-EnvironmentFile=/etc/dflux/dflux.env
-# Todavía puedes pasar argumentos (--direct-iface), pero no son obligatorios si los defines en el archivo .env.
+Type=notify
+NotifyAccess=main
+EnvironmentFile=-/etc/dflux/dflux.env
 ExecStart=/usr/local/bin/dflux mode enforce
 Restart=on-failure
-RestartSec=5
-# Limpiar estado de red al detenerse
-ExecStop=/usr/local/bin/dflux rollback
+RestartSec=3s
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+WatchdogSec=15s
+LimitNOFILE=65536
+LimitNOFILESoft=65536
 AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+ExecStop=/usr/local/bin/dflux rollback
+TimeoutStopSec=10s
 
 [Install]
 WantedBy=multi-user.target

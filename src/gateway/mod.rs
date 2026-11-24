@@ -1,14 +1,16 @@
+pub mod copy;
 pub mod inspector;
 
 use crate::egress::EgressManager;
 use crate::observability::{self, Level};
 use crate::state::{Decision, StateManager};
+use crate::telemetry;
 use anyhow::Result;
 use std::future::Future;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
 fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
@@ -42,8 +44,10 @@ pub async fn run_gateway(
     state_manager: StateManager,
     egress_mgr: Arc<EgressManager>,
 ) -> Result<()> {
+    let mut config = crate::config::DFluxConfig::default().gateway;
+    config.port = port;
     let listener = bind_gateway(port).await?;
-    run_gateway_with_listener(listener, state_manager, egress_mgr).await
+    run_gateway_with_listener(listener, state_manager, egress_mgr, config).await
 }
 
 pub async fn bind_gateway(port: u16) -> Result<tokio::net::TcpListener> {
@@ -79,34 +83,197 @@ pub async fn run_gateway_with_listener(
     listener: tokio::net::TcpListener,
     state_manager: StateManager,
     egress_mgr: Arc<EgressManager>,
+    config: crate::config::GatewayConfig,
 ) -> Result<()> {
     let addr = listener.local_addr()?;
-    println!("DFlux Transparent Gateway listening on {}", addr);
+    let max_conns = telemetry::calculate_safe_max_connections(config.max_connections);
+    println!(
+        "DFlux Transparent Gateway listening on {} (max connections: {}, idle timeout: {}s, half-close timeout: {}s)",
+        addr, max_conns, config.tcp_idle_timeout_secs, config.half_close_timeout_secs
+    );
 
-    // Semaphore to protect against connection floods (Circuit Breaker layer 1)
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(2000));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_conns));
+    let metrics = telemetry::global_metrics();
+
+    // Reserve file descriptor to shed connections gracefully on EMFILE
+    let mut reserve_fd = std::fs::File::open("/dev/null").ok();
+
+    let mut backoff = Duration::from_millis(25);
+    let mut consecutive_emfile = 0u32;
+    let mut emfile_start: Option<Instant> = None;
 
     loop {
-        let (stream, peer_addr) = listener.accept().await?;
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(conn) => {
+                backoff = Duration::from_millis(25);
+                consecutive_emfile = 0;
+                emfile_start = None;
+                if reserve_fd.is_none() {
+                    reserve_fd = std::fs::File::open("/dev/null").ok();
+                }
+                conn
+            }
+            Err(e) => {
+                let is_emfile = e.raw_os_error() == Some(libc::EMFILE)
+                    || e.raw_os_error() == Some(libc::ENFILE);
+
+                metrics
+                    .accept_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                if is_emfile {
+                    metrics
+                        .emfile_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    consecutive_emfile += 1;
+                    let start = emfile_start.get_or_insert_with(Instant::now);
+                    let duration_exhausted = start.elapsed();
+
+                    let open_fds = telemetry::get_open_fd_count();
+                    let (soft, hard) = telemetry::get_fd_limits();
+
+                    let mut event = observability::event(
+                        Level::Critical,
+                        "gateway_accept_emfile",
+                        "gateway",
+                        "listener_accept",
+                    );
+                    event.error_category = Some("fd_exhaustion".into());
+                    event.error_message = Some(e.to_string());
+                    event
+                        .fields
+                        .insert("open_fds".into(), serde_json::json!(open_fds));
+                    event
+                        .fields
+                        .insert("soft_limit".into(), serde_json::json!(soft));
+                    event
+                        .fields
+                        .insert("hard_limit".into(), serde_json::json!(hard));
+                    event.fields.insert(
+                        "consecutive_emfile".into(),
+                        serde_json::json!(consecutive_emfile),
+                    );
+                    event.fields.insert(
+                        "exhaustion_duration_ms".into(),
+                        serde_json::json!(duration_exhausted.as_millis()),
+                    );
+                    observability::emit(event);
+
+                    eprintln!(
+                        "CRITICAL: Gateway EMFILE/ENFILE (os error {})! Open FDs: {}/{}, consecutive errors: {}, duration: {:?}",
+                        e.raw_os_error().unwrap_or(0),
+                        open_fds,
+                        soft,
+                        consecutive_emfile,
+                        duration_exhausted
+                    );
+
+                    // Use reserve descriptor to shed pending connection if possible
+                    if let Some(fd) = reserve_fd.take() {
+                        drop(fd);
+                        if let Ok(Ok((shed_stream, _))) =
+                            tokio::time::timeout(Duration::from_millis(10), listener.accept()).await
+                        {
+                            drop(shed_stream);
+                        }
+                        reserve_fd = std::fs::File::open("/dev/null").ok();
+                    }
+
+                    // If starvation persists for > 30s without relief, trigger fatal abort so systemd can restart
+                    if duration_exhausted > Duration::from_secs(30) {
+                        let mut fatal_event = observability::event(
+                            Level::Critical,
+                            "gateway_fatal_emfile_exhaustion",
+                            "gateway",
+                            "listener_accept",
+                        );
+                        fatal_event.outcome = Some("fatal_shutdown".into());
+                        fatal_event.error_message =
+                            Some("EMFILE persistent for >30s without recovery".into());
+                        observability::emit(fatal_event);
+
+                        return Err(anyhow::anyhow!(
+                            "Fatal gateway EMFILE exhaustion: descriptor table saturated for {:?}; aborting for systemd restart",
+                            duration_exhausted
+                        ));
+                    }
+
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_millis(1000));
+                    continue;
+                }
+
+                if e.kind() == std::io::ErrorKind::ConnectionAborted
+                    || e.kind() == std::io::ErrorKind::Interrupted
+                {
+                    tracing::debug!("Transient accept error: {}", e);
+                    continue;
+                }
+
+                tracing::warn!("Gateway accept unexpected error: {}", e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+
+        metrics
+            .total_connections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let permit = match semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                eprintln!(
-                    "Max connections reached! Dropping traffic from {}",
-                    peer_addr
+                metrics
+                    .rejected_connections
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut event = observability::event(
+                    Level::Warn,
+                    "gateway_connection_rejected",
+                    "gateway",
+                    "concurrency_limit",
                 );
-                continue; // Drop to protect network health
+                event.error_category = Some("backpressure".into());
+                event
+                    .fields
+                    .insert("peer".into(), serde_json::json!(peer_addr.to_string()));
+                event
+                    .fields
+                    .insert("limit".into(), serde_json::json!(max_conns));
+                observability::emit(event);
+
+                eprintln!(
+                    "Max connections reached (limit: {})! Shedding traffic from {}",
+                    max_conns, peer_addr
+                );
+                drop(stream);
+                continue;
             }
         };
 
         let state_manager = state_manager.clone();
         let egress_mgr = egress_mgr.clone();
+        let conn_config = config.clone();
+        let conn_metrics = metrics.clone();
+
+        metrics
+            .active_connections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         tokio::spawn(async move {
-            let _permit = permit; // Will be dropped automatically when the task finishes
+            let _permit = permit;
+            struct ActiveGuard(Arc<crate::telemetry::GatewayMetrics>);
+            impl Drop for ActiveGuard {
+                fn drop(&mut self) {
+                    self.0
+                        .active_connections
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            let _guard = ActiveGuard(conn_metrics);
+
             if let Err(e) =
-                handle_gateway_client(stream, peer_addr, state_manager, egress_mgr).await
+                handle_gateway_client(stream, peer_addr, state_manager, egress_mgr, conn_config)
+                    .await
             {
                 eprintln!("Gateway client error: {}", e);
             }
@@ -119,14 +286,12 @@ async fn handle_gateway_client(
     peer_addr: SocketAddr,
     state_manager: StateManager,
     egress_mgr: Arc<EgressManager>,
+    config: crate::config::GatewayConfig,
 ) -> Result<()> {
     // 1. Get original destination IP
     let orig_dst = match get_original_dst(&client_stream) {
         Ok(dst) => dst,
         Err(e) => {
-            // If we can't get original destination, we can't forward properly unless we have SNI, but we need IP for non-SNI anyway.
-            // Wait, for testing directly without iptables redirect, we can fallback to peer_addr just to not crash, or just return.
-            // Let's log and return.
             eprintln!(
                 "Could not get original destination for {}: {}",
                 peer_addr, e
@@ -206,12 +371,18 @@ async fn handle_gateway_client(
     let _ = client_stream.set_nodelay(true);
     let _ = server_stream.set_nodelay(true);
 
-    // 5. High performance bidirectional copy with 128 KiB buffers
-    match tokio::io::copy_bidirectional_with_sizes(
+    let idle_timeout = Duration::from_secs(config.tcp_idle_timeout_secs);
+    let half_close_timeout = Duration::from_secs(config.half_close_timeout_secs);
+    let metrics = telemetry::global_metrics();
+
+    // 5. Bounded bidirectional copy with idle and half-close timeouts
+    match copy::copy_bidirectional_with_timeouts(
         &mut client_stream,
         &mut server_stream,
+        idle_timeout,
+        half_close_timeout,
         131072,
-        131072,
+        metrics,
     )
     .await
     {

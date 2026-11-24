@@ -1,0 +1,32 @@
+[Unit]
+Description=DFlux Transparent Egress Gateway
+Documentation=https://github.com/dflux/dflux
+After=network-online.target network.target systemd-networkd.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+EnvironmentFile=-/etc/dflux/dflux.env
+Environment=DFLUX_LOG_DIR=/var/log/dflux
+Environment=DFLUX_LOG_MAX_FILE_BYTES=10485760
+Environment=DFLUX_LOG_MAX_TOTAL_BYTES=104857600
+Environment=DFLUX_LOG_BUFFER_CAPACITY=2048
+ExecStart=/usr/local/bin/dflux mode enforce --direct-iface eth0
+Restart=on-failure
+RestartSec=3s
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+WatchdogSec=15s
+LimitNOFILE=65536
+LimitNOFILESoft=65536
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+ExecStop=/usr/local/bin/dflux rollback
+TimeoutStopSec=10s
+RuntimeDirectory=dflux
+RuntimeDirectoryMode=0700
+LogsDirectory=dflux
+LogsDirectoryMode=0775
+
+[Install]
+WantedBy=multi-user.target

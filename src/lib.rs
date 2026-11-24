@@ -8,3 +8,5 @@ pub mod probes;
 pub mod proxy;
 pub mod routing;
 pub mod state;
+pub mod systemd_notify;
+pub mod telemetry;

@@ -129,10 +129,10 @@ impl Observer {
             inner.events.pop_front();
             inner.dropped_events = inner.dropped_events.saturating_add(1);
         }
-        if let Some(directory) = &self.config.directory {
-            if let Err(error) = self.append_to_disk(directory, &event) {
-                tracing::warn!(error = %error, "observability disk write failed");
-            }
+        if let Some(directory) = &self.config.directory
+            && let Err(error) = self.append_to_disk(directory, &event)
+        {
+            tracing::warn!(error = %error, "observability disk write failed");
         }
         inner.events.push_back(event);
     }

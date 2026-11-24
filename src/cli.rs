@@ -55,11 +55,19 @@ pub enum Commands {
         remote_iface: Option<String>,
     },
     /// Manually remove DFlux routing rules if the daemon crashed
-    Rollback,
+    Rollback {
+        /// Also restore original sysctl net.ipv4.ip_forward (Warning: may break LAN clients if host is their gateway)
+        #[arg(long)]
+        restore_sysctls: bool,
+    },
     /// Show buffered diagnostic events and optionally export them as JSON
     Diagnose {
         /// Write the bounded diagnostic snapshot to this path
         #[arg(long)]
         export: Option<PathBuf>,
+
+        /// Show live gateway resource and connection metrics
+        #[arg(long)]
+        metrics: bool,
     },
 }

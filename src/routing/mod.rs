@@ -29,6 +29,12 @@ pub struct DeploymentState {
     pub send_redirects_original: Option<String>,
     #[serde(default)]
     pub conntrack_udp_timeout_stream_original: Option<String>,
+    #[serde(default = "default_true")]
+    pub preserve_ip_forward: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Manages routing rules using nftables and policy routing with strict concurrency control,
@@ -43,6 +49,7 @@ pub struct RoutingEngine {
     created_nft: AtomicBool,
     created_rule: AtomicBool,
     created_route: AtomicBool,
+    pub preserve_ip_forward: bool,
 }
 
 impl RoutingEngine {
@@ -68,6 +75,9 @@ impl RoutingEngine {
         exclude_subnets: String,
         run_dir: PathBuf,
     ) -> Self {
+        let preserve_ip_forward = std::env::var("DFLUX_PRESERVE_IP_FORWARD")
+            .map(|v| v.trim() != "0" && v.trim().to_lowercase() != "false")
+            .unwrap_or(true);
         Self {
             port,
             direct_iface,
@@ -78,7 +88,20 @@ impl RoutingEngine {
             created_nft: AtomicBool::new(false),
             created_rule: AtomicBool::new(false),
             created_route: AtomicBool::new(false),
+            preserve_ip_forward,
         }
+    }
+
+    pub fn with_preserve_forwarding(
+        port: u16,
+        direct_iface: String,
+        remote_iface: Option<String>,
+        exclude_subnets: String,
+        preserve_ip_forward: bool,
+    ) -> Self {
+        let mut engine = Self::new(port, direct_iface, remote_iface, exclude_subnets);
+        engine.preserve_ip_forward = preserve_ip_forward;
+        engine
     }
 
     /// Sets up transparent proxy rules using nftables TPROXY with pre-validation and rollback tracking.
@@ -129,6 +152,7 @@ impl RoutingEngine {
             ip_forward_original: None,
             send_redirects_original: None,
             conntrack_udp_timeout_stream_original: None,
+            preserve_ip_forward: self.preserve_ip_forward,
         };
 
         // 4. Configure kernel sysctls for transparent gateway forwarding
@@ -189,17 +213,16 @@ impl RoutingEngine {
             "/proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream",
             "net.netfilter.nf_conntrack_udp_timeout_stream",
         );
-        if let Some(ref ct_val) = orig_ct_udp {
-            if let Ok(secs) = ct_val.parse::<u32>() {
-                if secs < 180 {
-                    let _ = Self::write_sysctl(
-                        "/proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream",
-                        "net.netfilter.nf_conntrack_udp_timeout_stream",
-                        "180",
-                    );
-                    state.conntrack_udp_timeout_stream_original = orig_ct_udp;
-                }
-            }
+        if let Some(ref ct_val) = orig_ct_udp
+            && let Ok(secs) = ct_val.parse::<u32>()
+            && secs < 180
+        {
+            let _ = Self::write_sysctl(
+                "/proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream",
+                "net.netfilter.nf_conntrack_udp_timeout_stream",
+                "180",
+            );
+            state.conntrack_udp_timeout_stream_original = orig_ct_udp;
         }
 
         // 5. Step 1: Apply nftables tables (IPv4 and IPv6)
@@ -355,20 +378,20 @@ impl RoutingEngine {
         if let Ok(content) = fs::read_to_string(proc_path) {
             return Some(content.trim().to_string());
         }
-        if let Ok(output) = Command::new("sysctl").args(["-n", sysctl_name]).output() {
-            if output.status.success() {
-                return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
-            }
+        if let Ok(output) = Command::new("sysctl").args(["-n", sysctl_name]).output()
+            && output.status.success()
+        {
+            return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
         }
         None
     }
 
     /// Writes a kernel sysctl to procfs with fallback to the sysctl binary.
     pub fn write_sysctl(proc_path: &str, sysctl_name: &str, value: &str) -> Result<()> {
-        if let Ok(mut f) = OpenOptions::new().write(true).open(proc_path) {
-            if f.write_all(value.as_bytes()).is_ok() {
-                return Ok(());
-            }
+        if let Ok(mut f) = OpenOptions::new().write(true).open(proc_path)
+            && f.write_all(value.as_bytes()).is_ok()
+        {
+            return Ok(());
         }
         let res = Command::new("sysctl")
             .args(["-w", &format!("{sysctl_name}={value}")])
@@ -472,11 +495,16 @@ impl RoutingEngine {
         // Step 4: Restore sysctls if previously recorded
         if let Some(ref st) = loaded_state {
             if let Some(ref orig_fwd) = st.ip_forward_original {
-                if orig_fwd != "1" {
+                let should_preserve = self.preserve_ip_forward || st.preserve_ip_forward;
+                if !should_preserve && orig_fwd != "1" {
                     let _ = Self::write_sysctl(
                         "/proc/sys/net/ipv4/ip_forward",
                         "net.ipv4.ip_forward",
                         orig_fwd,
+                    );
+                } else {
+                    println!(
+                        "Preserving net.ipv4.ip_forward=1 to maintain LAN gateway connectivity."
                     );
                 }
             }

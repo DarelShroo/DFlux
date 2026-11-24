@@ -595,6 +595,7 @@ fn test_state_file_roundtrip_partial_state_and_absent_cleanup() {
         ip_forward_original: None,
         send_redirects_original: None,
         conntrack_udp_timeout_stream_original: None,
+        preserve_ip_forward: true,
     };
 
     RoutingEngine::save_state_to_path(&state_file, &state).expect("Atomic state write failed");

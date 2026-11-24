@@ -8,6 +8,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::egress::EgressManager;
+use crate::gateway::copy;
+use crate::telemetry;
+use std::time::{Duration, Instant};
 
 pub async fn run_proxy(
     port: u16,
@@ -15,19 +18,103 @@ pub async fn run_proxy(
     mode: String,
     egress_mgr: Arc<EgressManager>,
 ) -> Result<()> {
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&addr).await?;
-    println!("DFlux proxy listening on {}", addr);
+    let mut config = crate::config::DFluxConfig::default().gateway;
+    config.proxy_port = port;
+    run_proxy_with_config(config, state_manager, mode, egress_mgr).await
+}
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(2000));
+pub async fn run_proxy_with_config(
+    config: crate::config::GatewayConfig,
+    state_manager: StateManager,
+    mode: String,
+    egress_mgr: Arc<EgressManager>,
+) -> Result<()> {
+    let addr = format!("127.0.0.1:{}", config.proxy_port);
+    let listener = TcpListener::bind(&addr).await?;
+    let max_conns = telemetry::calculate_safe_max_connections(config.max_connections);
+    println!(
+        "DFlux proxy listening on {} (max connections: {}, idle timeout: {}s, half-close timeout: {}s)",
+        addr, max_conns, config.tcp_idle_timeout_secs, config.half_close_timeout_secs
+    );
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_conns));
+    let metrics = telemetry::global_metrics();
+
+    let mut backoff = Duration::from_millis(25);
+    let mut consecutive_emfile = 0u32;
+    let mut emfile_start: Option<Instant> = None;
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(conn) => {
+                backoff = Duration::from_millis(25);
+                consecutive_emfile = 0;
+                emfile_start = None;
+                conn
+            }
+            Err(e) => {
+                let is_emfile = e.raw_os_error() == Some(libc::EMFILE)
+                    || e.raw_os_error() == Some(libc::ENFILE);
+
+                metrics
+                    .accept_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                if is_emfile {
+                    metrics
+                        .emfile_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    consecutive_emfile += 1;
+                    let start = emfile_start.get_or_insert_with(Instant::now);
+                    let duration_exhausted = start.elapsed();
+
+                    eprintln!(
+                        "CRITICAL: Proxy EMFILE/ENFILE! Open FDs: {}/{}, consecutive: {}, duration: {:?}",
+                        telemetry::get_open_fd_count(),
+                        telemetry::get_fd_limits().0,
+                        consecutive_emfile,
+                        duration_exhausted
+                    );
+
+                    if duration_exhausted > Duration::from_secs(30) {
+                        return Err(anyhow::anyhow!(
+                            "Fatal proxy EMFILE exhaustion: descriptor table saturated for {:?}",
+                            duration_exhausted
+                        ));
+                    }
+
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_millis(1000));
+                    continue;
+                }
+
+                if e.kind() == std::io::ErrorKind::ConnectionAborted
+                    || e.kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+
+                tracing::warn!("Proxy accept error: {}", e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+
+        metrics
+            .total_connections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let permit = match semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                eprintln!("Max proxy connections reached!");
+                metrics
+                    .rejected_connections
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "Max proxy connections reached (limit: {})! Shedding traffic from {}",
+                    max_conns, peer_addr
+                );
+                drop(stream);
                 continue;
             }
         };
@@ -35,10 +122,28 @@ pub async fn run_proxy(
         let state_manager = state_manager.clone();
         let mode = mode.clone();
         let egress_mgr = egress_mgr.clone();
+        let conn_config = config.clone();
+        let conn_metrics = metrics.clone();
+
+        metrics
+            .active_connections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = handle_client(stream, state_manager, mode, egress_mgr).await {
+            struct ActiveGuard(Arc<crate::telemetry::GatewayMetrics>);
+            impl Drop for ActiveGuard {
+                fn drop(&mut self) {
+                    self.0
+                        .active_connections
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            let _guard = ActiveGuard(conn_metrics);
+
+            if let Err(e) =
+                handle_client(stream, state_manager, mode, egress_mgr, conn_config).await
+            {
                 eprintln!("Client error: {}", e);
             }
         });
@@ -50,6 +155,7 @@ async fn handle_client(
     state_manager: StateManager,
     mode: String,
     egress_mgr: Arc<EgressManager>,
+    config: crate::config::GatewayConfig,
 ) -> Result<()> {
     let mut buf = [0u8; 4096];
     let n = client_stream.read(&mut buf).await?;
@@ -133,12 +239,18 @@ async fn handle_client(
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
 
-    // Copy bi-directional with 128 KiB buffers
-    match tokio::io::copy_bidirectional_with_sizes(
+    let idle_timeout = Duration::from_secs(config.tcp_idle_timeout_secs);
+    let half_close_timeout = Duration::from_secs(config.half_close_timeout_secs);
+    let metrics = telemetry::global_metrics();
+
+    // Copy bi-directional with idle and half-close timeouts
+    match copy::copy_bidirectional_with_timeouts(
         &mut client_stream,
         &mut server_stream,
+        idle_timeout,
+        half_close_timeout,
         131072,
-        131072,
+        metrics,
     )
     .await
     {

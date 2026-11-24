@@ -2,6 +2,22 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 
+fn default_tcp_idle_timeout() -> u64 {
+    120
+}
+
+fn default_half_close_timeout() -> u64 {
+    15
+}
+
+fn default_connect_timeout() -> u64 {
+    4
+}
+
+fn default_preserve_ip_forward() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DFluxConfig {
     pub egress: EgressConfig,
@@ -20,6 +36,18 @@ pub struct GatewayConfig {
     pub proxy_port: u16,
     pub enable_transparent: bool,
     pub exclude_subnets: String,
+    #[serde(default = "default_tcp_idle_timeout")]
+    pub tcp_idle_timeout_secs: u64,
+    #[serde(default = "default_half_close_timeout")]
+    pub half_close_timeout_secs: u64,
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+    #[serde(default = "default_preserve_ip_forward")]
+    pub preserve_ip_forward: bool,
+    #[serde(default)]
+    pub watchdog_secs: Option<u64>,
 }
 
 impl Default for DFluxConfig {
@@ -50,6 +78,27 @@ impl Default for DFluxConfig {
                 exclude_subnets: std::env::var("DFLUX_EXCLUDE_SUBNETS").unwrap_or_else(|_| {
                     "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8".to_string()
                 }),
+                tcp_idle_timeout_secs: std::env::var("DFLUX_TCP_IDLE_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(120),
+                half_close_timeout_secs: std::env::var("DFLUX_HALF_CLOSE_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(15),
+                connect_timeout_secs: std::env::var("DFLUX_CONNECT_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(4),
+                max_connections: std::env::var("DFLUX_MAX_CONNECTIONS")
+                    .ok()
+                    .and_then(|p| p.parse().ok()),
+                preserve_ip_forward: std::env::var("DFLUX_PRESERVE_IP_FORWARD")
+                    .map(|v| v.trim() != "0" && v.trim().to_lowercase() != "false")
+                    .unwrap_or(true),
+                watchdog_secs: std::env::var("DFLUX_WATCHDOG_SECS")
+                    .ok()
+                    .and_then(|p| p.parse().ok()),
             },
         }
     }
@@ -98,6 +147,16 @@ impl DFluxConfig {
         if self.gateway.port == 0 || self.gateway.proxy_port == 0 {
             return Err(anyhow::anyhow!("gateway ports must be non-zero"));
         }
+        if self.gateway.tcp_idle_timeout_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "tcp_idle_timeout_secs must be greater than 0"
+            ));
+        }
+        if self.gateway.half_close_timeout_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "half_close_timeout_secs must be greater than 0"
+            ));
+        }
         for subnet in self.gateway.exclude_subnets.split(',') {
             let subnet = subnet.trim();
             let Some((address, prefix)) = subnet.split_once('/') else {
@@ -140,10 +199,10 @@ impl DFluxConfig {
         // In virtualized/container environments (LXC, Docker veth), physical network devices
         // appear under /sys/devices/virtual/net without a hardware 'device' symlink,
         // but have link type 1 (ARPHRD_ETHER).
-        if let Ok(type_str) = std::fs::read_to_string(iface_dir.join("type")) {
-            if type_str.trim() == "1" {
-                return true;
-            }
+        if let Ok(type_str) = std::fs::read_to_string(iface_dir.join("type"))
+            && type_str.trim() == "1"
+        {
+            return true;
         }
         false
     }
@@ -196,6 +255,12 @@ mod tests {
                 proxy_port: 8080,
                 enable_transparent: true,
                 exclude_subnets: "127.0.0.0/8".into(),
+                tcp_idle_timeout_secs: 120,
+                half_close_timeout_secs: 15,
+                connect_timeout_secs: 4,
+                max_connections: None,
+                preserve_ip_forward: true,
+                watchdog_secs: None,
             },
         }
     }
